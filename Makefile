@@ -6,7 +6,7 @@ include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = Disasm
 Disasm_FILES = Tweak.xm
-Disasm_CFLAGS = -fobjc-arc -fmodules
+Disasm_CFLAGS = -fobjc-arc -fmodules -Wno-deprecated-declarations
 Disasm_FRAMEWORKS = UIKit Foundation
 Disasm_LIBRARIES = substrate
 
