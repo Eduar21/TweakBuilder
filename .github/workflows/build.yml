@@ -11,9 +11,6 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install Theos
         uses: Randomblock1/theos-action@v1
-      - name: Create Filter Plist
-        run: |
-          echo '<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>Filter</key><dict><key>Bundles</key><array><string>com.pandora.iphone</string></array></dict></dict></plist>' > Disasm.plist
       - name: Build
         run: make package FINALPACKAGE=1
       - name: Upload
