@@ -98,7 +98,7 @@ void decode_arm64(uint32_t e, uint64_t addr,
             "GE","LT","GT","LE","AL","NV"};
         int32_t off=(int32_t)((e>>5)&0x7FFFF);
         if(off&0x40000)off|=~0x7FFFF; off<<=2;
-        vsnprintf(mn,64,"B.%s",cc[e&0xF]);
+        snprintf(mn,64,"B.%s",cc[e&0xF]);
         fmt_ops(ops,128,"0x%llx",addr+(int64_t)off);return;}
     if((e&0x7F000000)==0x34000000){
         int32_t off=(int32_t)((e&0x00FFFFE0)>>3);
@@ -376,7 +376,7 @@ static void show_result(NSString *text) {
              forState:UIControlStateNormal];
         [btn setTitleColor:[UIColor whiteColor]
                   forState:UIControlStateNormal];
-        objc_setAssociatedObject(win,"selfref",
+        objc_setAssociatedObject(win,"selfref", win,(objc_AssociationPolicy)01401),
             win,OBJC_ASSOCIATION_RETAIN);
         [btn addTarget:win
                 action:NSSelectorFromString(@"hide")
