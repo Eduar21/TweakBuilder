@@ -376,8 +376,6 @@ static void show_result(NSString *text) {
              forState:UIControlStateNormal];
         [btn setTitleColor:[UIColor whiteColor]
                   forState:UIControlStateNormal];
-        objc_setAssociatedObject(win,"selfref", win,(objc_AssociationPolicy)01401),
-            win,OBJC_ASSOCIATION_RETAIN);
         [btn addTarget:win
                 action:NSSelectorFromString(@"hide")
       forControlEvents:UIControlEventTouchUpInside];
