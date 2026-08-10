@@ -1,0 +1,7 @@
+Package: com.eduar21.disasm
+Name: Disasm
+Version: 1.0
+Architecture: iphoneos-arm64
+Description: iOS Tweak
+Author: Eduar21
+Section: Tweaks
