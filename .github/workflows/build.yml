@@ -13,9 +13,19 @@ jobs:
         uses: Randomblock1/theos-action@v1
       - name: Build
         run: make package FINALPACKAGE=1
-      - name: Upload
+      - name: Strip signature
+        run: |
+          ldid -S .theos/obj/arm64/Disasm.dylib
+          codesign --remove-signature .theos/obj/arm64/Disasm.dylib || true
+      - name: Upload deb
         uses: actions/upload-artifact@v4
         with:
           name: Disasm-deb
           path: packages/*.deb
+          retention-days: 7
+      - name: Upload dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: Disasm-dylib
+          path: .theos/obj/arm64/Disasm.dylib
           retention-days: 7
