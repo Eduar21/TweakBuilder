@@ -7,7 +7,6 @@
 #include <dlfcn.h>
 #include <stdatomic.h>
 #include <pthread.h>
-#include <cxxabi.h>
 
 #define SAMPLE_MS    150
 #define MAX_LOG      1000
@@ -58,27 +57,34 @@ static void add_log(NSString *line) {
 // ── Demangle C++ symbols ──
 static NSString *demangle(const char *sym) {
     if(!sym) return @"?";
-
-    // Si no empieza con _Z no es C++ mangled
     if(sym[0] != '_' || sym[1] != 'Z')
         return [NSString stringWithUTF8String:sym];
 
-    int status = 0;
-    char *demangled =
-        __cxa_demangle(sym, NULL, NULL, &status);
-
-    if(status == 0 && demangled) {
-        NSString *result =
-            [NSString stringWithUTF8String:demangled];
-        free(demangled);
-
-        // Truncar si es muy largo
-        if(result.length > 80)
-            result = [[result substringToIndex:77]
-                stringByAppendingString:@"..."];
-        return result;
+    // Obtener __cxa_demangle via dlsym
+    // en runtime sin necesitar el header C++
+    typedef char* (*demangle_fn)(
+        const char*, char*, size_t*, int*);
+    static demangle_fn fn = NULL;
+    if(!fn) {
+        fn = (demangle_fn)dlsym(
+            RTLD_DEFAULT, "__cxa_demangle");
     }
-    // Fallback — símbolo original truncado
+
+    if(fn) {
+        int status = 0;
+        char *d = fn(sym, NULL, NULL, &status);
+        if(status == 0 && d) {
+            NSString *r =
+                [NSString stringWithUTF8String:d];
+            free(d);
+            if(r.length > 80)
+                r = [[r substringToIndex:77]
+                    stringByAppendingString:@"..."];
+            return r;
+        }
+    }
+
+    // Fallback
     NSString *orig =
         [NSString stringWithUTF8String:sym];
     return orig.length > 80 ?
