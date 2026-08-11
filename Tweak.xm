@@ -168,8 +168,31 @@ static void run_analysis(void) {
         NSBundle.mainBundle.bundleIdentifier.UTF8String?:"?");
     xout("PID: %d\n\n", getpid());
 
-    const char *bin=_dyld_get_image_name(0);
-    xout("Binario: %s\n\n",bin);
+    // Buscar el binario real de la app
+    // saltando LiveProcess de LiveContainer
+    const char *bin = NULL;
+    uint32_t img_count = _dyld_image_count();
+    uint32_t target_idx = 0;
+    xout("Imagenes dyld: %u\n", img_count);
+
+    for(uint32_t i = 0; i < img_count; i++){
+        const char *name = _dyld_get_image_name(i);
+        if(!name) continue;
+        // Saltar LiveProcess y dylibs del sistema
+        if(strstr(name, "LiveProcess")) continue;
+        if(strstr(name, "usr/lib"))     continue;
+        if(strstr(name, "System"))      continue;
+        if(strstr(name, "framework"))   continue;
+        // El primer binario que queda es la app target
+        bin = name;
+        target_idx = i;
+        break;
+    }
+    if(!bin) {
+        bin = _dyld_get_image_name(0);
+        target_idx = 0;
+    }
+    xout("Target [%u]: %s\n\n", target_idx, bin);
 
     // ── Intentar leer desde disco ──
     FILE *f=fopen(bin,"rb");
@@ -181,8 +204,8 @@ static void run_analysis(void) {
         xout("Disco bloqueado - modo memoria\n\n");
         const struct mach_header_64 *mh=
             (const struct mach_header_64*)
-            _dyld_get_image_header(0);
-        intptr_t slide=_dyld_get_image_vmaddr_slide(0);
+            _dyld_get_image_header(target_idx);
+        intptr_t slide=_dyld_get_image_vmaddr_slide(target_idx);
         xout("Slide: 0x%llx\n\n",(uint64_t)slide);
 
         uint8_t *lc=(uint8_t*)mh+
@@ -495,4 +518,3 @@ static void *thread_fn(void *arg) {
     pthread_create(&t,NULL,thread_fn,NULL);
     pthread_detach(t);
 }
-
