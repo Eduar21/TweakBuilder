@@ -641,6 +641,12 @@ static void update_ui(void) {
 @implementation PassthroughWindow
 - (UIView *)hitTest:(CGPoint)point
           withEvent:(UIEvent *)event {
+    // 0. Si hay un VC modal presentado (UIAlertController, sheet),
+    //    la ventana debe comportarse normal: si no, el passthrough
+    //    se traga los toques y los botones del alert no responden.
+    if(self.rootViewController.presentedViewController) {
+        return [super hitTest:point withEvent:event];
+    }
     // FAB
     if(g_fab && !g_fab.hidden) {
         CGPoint p = [self convertPoint:point
@@ -920,12 +926,34 @@ static void update_ui(void) {
 
 // ── Build UI ──
 static void build_ui(void) {
-    CGRect screen = UIScreen.mainScreen.bounds;
+    // Atar a la escena activa. Sin esto, en iOS 13+ una UIWindow
+    // suelta puede NO mostrarse (causa probable del "desapareció
+    // hoy": si a los 3s no había escena activa, la ventana se crea
+    // pero nunca se pinta).
+    UIWindowScene *scene = nil;
+    for(UIScene *s in UIApplication.sharedApplication.connectedScenes) {
+        if([s isKindOfClass:UIWindowScene.class] &&
+           s.activationState ==
+               UISceneActivationStateForegroundActive) {
+            scene = (UIWindowScene *)s;
+            break;
+        }
+    }
+    if(!scene) {
+        // ninguna escena activa todavía: reintentar en 1s
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+            (int64_t)(1 * NSEC_PER_SEC)),
+            dispatch_get_main_queue(), ^{ build_ui(); });
+        return;
+    }
+
+    CGRect screen = scene.coordinateSpace.bounds;
     CGFloat W = screen.size.width;
     CGFloat H = screen.size.height;
 
     g_window = [[PassthroughWindow alloc]
-        initWithFrame:screen];
+        initWithWindowScene:scene];
+    g_window.frame = screen;
     g_window.windowLevel =
         UIWindowLevelAlert + 200;
     g_window.backgroundColor = UIColor.clearColor;
@@ -1101,6 +1129,12 @@ static void build_ui(void) {
 
 // ── CTOR ──
 %ctor {
+    // MARCADOR de diagnóstico: si aparece este archivo con hora de
+    // hoy, el %ctor SÍ corre (o sea el dylib se inyectó bien).
+    [@"ctor ok" writeToFile:[NSHomeDirectory()
+        stringByAppendingPathComponent:@"Documents/tracer_marker.txt"]
+        atomically:YES encoding:NSUTF8StringEncoding error:nil];
+
     g_log  = [NSMutableString new];
     g_lock = [NSLock new];
 
@@ -1128,5 +1162,4 @@ static void build_ui(void) {
         build_ui();
     });
 }
-
 
