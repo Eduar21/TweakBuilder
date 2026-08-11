@@ -54,6 +54,78 @@ static void add_log(NSString *line) {
     [g_lock unlock];
 }
 
+// ── Demangle C++ symbols ──
+static NSString *demangle(const char *sym) {
+    if(!sym) return @"?";
+
+    // Si no empieza con _Z no es C++ mangled
+    if(sym[0] != '_' || sym[1] != 'Z')
+        return [NSString stringWithUTF8String:sym];
+
+    int status = 0;
+    char *demangled =
+        __cxa_demangle(sym, NULL, NULL, &status);
+
+    if(status == 0 && demangled) {
+        NSString *result =
+            [NSString stringWithUTF8String:demangled];
+        free(demangled);
+
+        // Truncar si es muy largo
+        if(result.length > 80)
+            result = [[result substringToIndex:77]
+                stringByAppendingString:@"..."];
+        return result;
+    }
+    // Fallback — símbolo original truncado
+    NSString *orig =
+        [NSString stringWithUTF8String:sym];
+    return orig.length > 80 ?
+        [[orig substringToIndex:77]
+            stringByAppendingString:@"..."] :
+        orig;
+}
+
+// ── Categorizar símbolo ──
+static NSString *categorize(NSString *sym) {
+    if([sym containsString:@"quic"] ||
+       [sym containsString:@"QUIC"] ||
+       [sym containsString:@"socket"] ||
+       [sym containsString:@"Socket"] ||
+       [sym containsString:@"Network"] ||
+       [sym containsString:@"network"] ||
+       [sym containsString:@"tigon"] ||
+       [sym containsString:@"IOBuf"] ||
+       [sym containsString:@"http"] ||
+       [sym containsString:@"HTTP"])
+        return @"🌐";
+
+    if([sym containsString:@"IG"] ||
+       [sym containsString:@"Instagram"])
+        return @"📷";
+
+    if([sym containsString:@"UI"] ||
+       [sym containsString:@"View"] ||
+       [sym containsString:@"Layout"] ||
+       [sym containsString:@"render"] ||
+       [sym containsString:@"Render"])
+        return @"🎨";
+
+    if([sym containsString:@"facebook"] ||
+       [sym containsString:@"Facebook"] ||
+       [sym containsString:@"folly"] ||
+       [sym containsString:@"Folly"] ||
+       [sym containsString:@"MCF"] ||
+       [sym containsString:@"XPlugin"])
+        return @"⚙️";
+
+    if([sym containsString:@"swift"] ||
+       [sym containsString:@"Swift"])
+        return @"🔶";
+
+    return @"◆";
+}
+
 // ── Tracer thread — samplea PCs de threads de la app ──
 static void *tracer_thread(void *arg) {
     g_self_thread = pthread_self();
@@ -112,24 +184,18 @@ if(pt == g_self_thread) continue;
 
                 // Resolver nombre
                 NSString *sym;
-                if(info.dli_sname) {
-                    // Tiene símbolo — truncar si es largo
-                    NSString *full = [NSString
-                        stringWithUTF8String:
-                        info.dli_sname];
-                    sym = full.length > 60 ?
-                        [full substringToIndex:60] :
-                        full;
-                } else {
-                    // Sin símbolo — offset relativo
-                    uint64_t off = g_base ?
-                        pc - g_base : pc;
-                    sym = [NSString stringWithFormat:
-                        @"+0x%llx", off];
-                }
+if(info.dli_sname) {
+    sym = demangle(info.dli_sname);
+} else {
+    uint64_t off = g_base ?
+        pc - g_base : pc;
+    sym = [NSString stringWithFormat:
+        @"+0x%llx", off];
+}
 
-                [entry appendFormat:
-                    @"  [t%u] %@\n", t, sym];
+NSString *cat = categorize(sym);
+[entry appendFormat:
+    @"  %@ [t%u] %@\n", cat, t, sym];
             }
 
             if(entry.length > 0) {
@@ -521,4 +587,5 @@ static void build_ui(void) {
         build_ui();
     });
 }
+
 
