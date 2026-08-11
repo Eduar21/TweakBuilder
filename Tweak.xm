@@ -338,6 +338,44 @@ static id my_NSStringFromClass(Class aClass) {
     return orig_NSStringFromClass(aClass);     // llama al real
 }
 
+// ── Force-0 genérico: neutraliza una función C por GOT ──
+// Fuerza el retorno a 0/NO. Sirve para checks anti-tamper que
+// devuelven BOOL/int/puntero. NO llama al original: por eso el
+// mismatch de firma no importa (nunca leemos args). Caveat: no
+// sirve si la función retorna float/double o un struct.
+static long my_force0(void) { return 0; }
+
+typedef struct {
+    void **slot;      // slot del GOT
+    void  *orig;      // puntero original (para restaurar)
+    char   name[128]; // símbolo
+} force_hook_t;
+
+#define MAX_FORCE 16
+static force_hook_t g_force[MAX_FORCE];
+static int          g_force_n = 0;
+
+// Devuelve YES si instaló, NO si no encontró el slot o está lleno.
+static BOOL force0_add(const char *name) {
+    if(g_force_n >= MAX_FORCE) return NO;
+    void **slot = find_got_slot(name);
+    if(!slot) return NO;                 // no está en el GOT (interno)
+    void *orig = NULL;
+    if(!got_hook(slot, (void*)my_force0, &orig)) return NO;
+    g_force[g_force_n].slot = slot;
+    g_force[g_force_n].orig = orig;
+    strncpy(g_force[g_force_n].name, name, 127);
+    g_force[g_force_n].name[127] = 0;
+    g_force_n++;
+    return YES;
+}
+
+static void force0_clear_all(void) {
+    for(int i = 0; i < g_force_n; i++)
+        got_unhook(g_force[i].slot, g_force[i].orig);
+    g_force_n = 0;
+}
+
 // Busca en el GOT de la app el slot cuyo símbolo resuelto == want.
 // Devuelve la dirección del SLOT (void**) o NULL. Sin hardcodear:
 // se recalcula en runtime, así resiste el slide de ASLR.
@@ -788,38 +826,56 @@ static void update_ui(void) {
 }
 
 + (void)installHook {
-    dispatch_async(
-        dispatch_get_global_queue(
-            DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        if(!g_demo_hooked) {
-            void **slot = find_got_slot("NSStringFromClass");
-            if(!slot) {
-                add_log(@"[HOOK] slot no encontrado "
-                        @"(toca GOT y reintenta)");
-                return;
-            }
-            if(got_hook(slot, (void*)my_NSStringFromClass,
-                        (void**)&orig_NSStringFromClass)) {
-                g_nsstr_slot  = slot;
-                g_demo_hooked = YES;
-                add_log([NSString stringWithFormat:
-                    @"[HOOK] NSStringFromClass @ %p ON",
-                    (void*)slot]);
-                [self setButtonTag:201 title:@"UNHOOK"];
-            } else {
-                add_log(@"[HOOK] fallo (vm_protect)");
-            }
-        } else {
-            if(g_nsstr_slot &&
-               got_unhook(g_nsstr_slot,
-                          (void*)orig_NSStringFromClass)) {
-                g_demo_hooked = NO;
-                add_log(@"[HOOK] NSStringFromClass OFF");
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIAlertController *a = [UIAlertController
+            alertControllerWithTitle:@"Force-0 (GOT)"
+                             message:@"Símbolo C a forzar a 0/NO"
+                      preferredStyle:UIAlertControllerStyleAlert];
+        [a addTextFieldWithConfigurationHandler:
+            ^(UITextField *tf){
+            tf.placeholder = @"METADeviceAppearsJailbroken";
+            tf.autocorrectionType = UITextAutocorrectionTypeNo;
+            tf.autocapitalizationType =
+                UITextAutocapitalizationTypeNone;
+        }];
+        [a addAction:[UIAlertAction actionWithTitle:@"Forzar 0"
+            style:UIAlertActionStyleDefault
+            handler:^(UIAlertAction *x){
+            NSString *nm = a.textFields.firstObject.text;
+            dispatch_async(dispatch_get_global_queue(
+                DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+                if(!nm.length) { add_log(@"[FORCE] vacío"); return; }
+                if(force0_add(nm.UTF8String)) {
+                    add_log([NSString stringWithFormat:
+                        @"[FORCE] %@ -> 0 (activos: %d)",
+                        nm, g_force_n]);
+                } else {
+                    add_log([NSString stringWithFormat:
+                        @"[FORCE] %@ no está en el GOT "
+                        @"(interno o mal escrito)", nm]);
+                }
+                [self setButtonTag:201 title:(g_force_n
+                    ? [NSString stringWithFormat:@"HOOK·%d",
+                        g_force_n] : @"HOOK")];
+            });
+        }]];
+        [a addAction:[UIAlertAction actionWithTitle:@"Quitar todos"
+            style:UIAlertActionStyleDestructive
+            handler:^(UIAlertAction *x){
+            dispatch_async(dispatch_get_global_queue(
+                DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+                force0_clear_all();
+                add_log(@"[FORCE] todos quitados");
                 [self setButtonTag:201 title:@"HOOK"];
-            } else {
-                add_log(@"[HOOK] fallo al quitar");
-            }
-        }
+            });
+        }]];
+        [a addAction:[UIAlertAction actionWithTitle:@"Cancelar"
+            style:UIAlertActionStyleCancel handler:nil]];
+        UIViewController *root = g_window.rootViewController;
+        while(root.presentedViewController)
+            root = root.presentedViewController;
+        [root presentViewController:a animated:YES
+                         completion:nil];
     });
 }
 
@@ -1162,4 +1218,3 @@ static void build_ui(void) {
         build_ui();
     });
 }
-
