@@ -445,6 +445,78 @@ static void my_viewDidAppear(id self, SEL _cmd, BOOL animated) {
     if(orig_vda) orig_vda(self, _cmd, animated); // llama al real
 }
 
+// ════════════════════════════════════════════
+//  ENUMERACIÓN: métodos e ivars de una clase
+// ════════════════════════════════════════════
+// Sirven para elegir objetivos de swizzling. El type encoding
+// te da la firma exacta del trampolín. Ej: "v24@0:8B16" =
+// retorna void(v); self(@)@0, _cmd(:)@8, BOOL(B)@16.
+// OJO Swift: solo aparecen métodos @objc/dynamic. Clases con
+// módulo (Modulo.Clase) suelen necesitar el nombre mangled.
+
+static void dump_class_methods(const char *clsname) {
+    if(!clsname || !clsname[0]) {
+        add_log(@"[DUMP] nombre vacío"); return;
+    }
+    Class cls = objc_getClass(clsname);
+    if(!cls) {
+        add_log([NSString stringWithFormat:
+            @"[DUMP] no encontrada: %s "
+            @"(¿Swift con módulo? usa mangled)", clsname]);
+        return;
+    }
+    add_log([NSString stringWithFormat:
+        @"═══ MÉTODOS %s ═══", clsname]);
+
+    unsigned int n = 0;
+    Method *ml = class_copyMethodList(cls, &n);
+    add_log([NSString stringWithFormat:
+        @"── instancia: %u ──", n]);
+    for(unsigned int i = 0; i < n; i++) {
+        const char *enc = method_getTypeEncoding(ml[i]);
+        add_log([NSString stringWithFormat:@"  -%s  %s",
+            sel_getName(method_getName(ml[i])), enc ?: ""]);
+    }
+    if(ml) free(ml);
+
+    Class meta = object_getClass((id)cls);
+    n = 0;
+    ml = class_copyMethodList(meta, &n);
+    add_log([NSString stringWithFormat:
+        @"── clase: %u ──", n]);
+    for(unsigned int i = 0; i < n; i++) {
+        const char *enc = method_getTypeEncoding(ml[i]);
+        add_log([NSString stringWithFormat:@"  +%s  %s",
+            sel_getName(method_getName(ml[i])), enc ?: ""]);
+    }
+    if(ml) free(ml);
+    add_log(@"═══════════════════");
+}
+
+static void dump_class_ivars(const char *clsname) {
+    if(!clsname || !clsname[0]) {
+        add_log(@"[IVARS] nombre vacío"); return;
+    }
+    Class cls = objc_getClass(clsname);
+    if(!cls) {
+        add_log([NSString stringWithFormat:
+            @"[IVARS] no encontrada: %s", clsname]);
+        return;
+    }
+    unsigned int n = 0;
+    Ivar *iv = class_copyIvarList(cls, &n);
+    add_log([NSString stringWithFormat:
+        @"═══ IVARS %s (%u) ═══", clsname, n]);
+    for(unsigned int i = 0; i < n; i++) {
+        const char *tp = ivar_getTypeEncoding(iv[i]);
+        add_log([NSString stringWithFormat:@"  +0x%lx %s  %s",
+            (long)ivar_getOffset(iv[i]),
+            ivar_getName(iv[i]) ?: "?", tp ?: ""]);
+    }
+    if(iv) free(iv);
+    add_log(@"═══════════════════");
+}
+
 // ── Tracer thread — samplea PCs de threads de la app ──
 static void *tracer_thread(void *arg) {
     g_self_thread = pthread_self();
@@ -768,6 +840,65 @@ static void update_ui(void) {
     }
 }
 
++ (void)promptClass:(NSString*)title
+             action:(void(^)(NSString*))action {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIAlertController *a = [UIAlertController
+            alertControllerWithTitle:title
+                             message:@"Nombre de clase (runtime ObjC)"
+                      preferredStyle:UIAlertControllerStyleAlert];
+        [a addTextFieldWithConfigurationHandler:
+            ^(UITextField *tf){
+            tf.placeholder = @"IGMedia";
+            tf.autocorrectionType = UITextAutocorrectionTypeNo;
+            tf.autocapitalizationType =
+                UITextAutocapitalizationTypeNone;
+        }];
+        [a addAction:[UIAlertAction actionWithTitle:@"OK"
+            style:UIAlertActionStyleDefault
+            handler:^(UIAlertAction *x){
+            action(a.textFields.firstObject.text);
+        }]];
+        [a addAction:[UIAlertAction actionWithTitle:@"Cancelar"
+            style:UIAlertActionStyleCancel handler:nil]];
+        UIViewController *root = g_window.rootViewController;
+        while(root.presentedViewController)
+            root = root.presentedViewController;
+        [root presentViewController:a animated:YES
+                         completion:nil];
+    });
+}
+
++ (void)dumpClass {
+    [self promptClass:@"Dump métodos"
+               action:^(NSString *name){
+        dispatch_async(dispatch_get_global_queue(
+            DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+            dump_class_methods(name.UTF8String);
+        });
+    }];
+}
+
++ (void)dumpIvars {
+    [self promptClass:@"Dump ivars"
+               action:^(NSString *name){
+        dispatch_async(dispatch_get_global_queue(
+            DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+            dump_class_ivars(name.UTF8String);
+        });
+    }];
+}
+
++ (void)copyLog {
+    [g_lock lock];
+    NSString *text = [g_log copy];
+    [g_lock unlock];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIPasteboard.generalPasteboard.string = text ?: @"";
+        add_log(@"[COPY] log al portapapeles");
+    });
+}
+
 + (void)fabDragged:(UIPanGestureRecognizer*)pan {
     CGPoint t = [pan translationInView:g_window];
     CGPoint newCenter = CGPointMake(
@@ -877,10 +1008,12 @@ static void build_ui(void) {
 
     // Botones
     NSArray *titles  = @[@"TRACE", @"GOT", @"CLEAR",
-                         @"HOOK",  @"SWZ", @"SAVE"];
+                         @"HOOK",  @"SWZ", @"SAVE",
+                         @"DUMP",  @"IVARS", @"COPY"];
     NSArray *sels    = @[@"toggleTrace", @"readGOT", @"clearLog",
                          @"installHook", @"installSwizzle",
-                         @"saveLog"];
+                         @"saveLog",
+                         @"dumpClass", @"dumpIvars", @"copyLog"];
     NSArray *colors  = @[
         [UIColor colorWithRed:0.1 green:0.5
                         blue:0.1 alpha:1],   // TRACE
@@ -894,9 +1027,15 @@ static void build_ui(void) {
                         blue:0.5 alpha:1],   // SWZ
         [UIColor colorWithRed:0.1 green:0.2
                         blue:0.6 alpha:1],   // SAVE
+        [UIColor colorWithRed:0.15 green:0.45
+                        blue:0.35 alpha:1],  // DUMP
+        [UIColor colorWithRed:0.35 green:0.35
+                        blue:0.15 alpha:1],  // IVARS
+        [UIColor colorWithRed:0.35 green:0.35
+                        blue:0.4 alpha:1],   // COPY
     ];
     CGFloat bw = (pw - 28) / 3.0;            // 3 por fila
-    for(int i = 0; i < 6; i++) {
+    for(int i = 0; i < 9; i++) {
         int row = i / 3;
         int col = i % 3;
         UIButton *b = [UIButton
@@ -922,7 +1061,7 @@ static void build_ui(void) {
     }
 
     // TextView
-    CGFloat tv_y = 116;
+    CGFloat tv_y = 156;
     g_textview = [[UITextView alloc]
         initWithFrame:CGRectMake(
             6, tv_y,
@@ -989,3 +1128,5 @@ static void build_ui(void) {
         build_ui();
     });
 }
+
+
