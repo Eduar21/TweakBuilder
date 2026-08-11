@@ -280,11 +280,9 @@ static void read_got(void) {
 //  HOOK POR REDIRECCIÓN DE GOT
 // ════════════════════════════════════════════
 
-// Núcleo: sobrescribe un slot del GOT y devuelve el original.
-static bool got_hook(void **slot, void *replacement,
-                     void **out_original) {
+// Núcleo: abre el slot RW, escribe un valor, restaura RO.
+static bool got_write(void **slot, void *value) {
     if(!slot) return false;
-    if(out_original) *out_original = *slot;   // guarda el real
 
     mach_port_t task = mach_task_self();
     // En Apple Silicon la página es de 16KB: usa vm_page_size.
@@ -298,17 +296,34 @@ static bool got_hook(void **slot, void *replacement,
         false, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
     if(kr != KERN_SUCCESS) return false;
 
-    *slot = replacement;                      // pisa el slot
+    *slot = value;                            // escribe
 
     // Restaura RO (opcional; los reads siguen permitidos).
     vm_protect(task, page, vm_page_size, false, VM_PROT_READ);
     return true;
 }
 
+// Instala: guarda el original y pisa el slot con replacement.
+static bool got_hook(void **slot, void *replacement,
+                     void **out_original) {
+    if(!slot) return false;
+    void *orig = *slot;                       // capturar antes
+    if(!got_write(slot, replacement)) return false;
+    if(out_original) *out_original = orig;     // solo si el write pegó
+    return true;
+}
+
+// Quita: restaura el puntero original en el slot.
+static bool got_unhook(void **slot, void *original) {
+    return got_write(slot, original);
+}
+
 // Hook demo: NSStringFromClass (firma CONOCIDA -> PoC seguro).
 //   NSString *NSStringFromClass(Class aClass);
 typedef id (*NSStringFromClass_t)(Class);
 static NSStringFromClass_t orig_NSStringFromClass = NULL;
+static void **g_nsstr_slot   = NULL;   // slot guardado, para unhook
+static BOOL   g_demo_hooked  = NO;
 
 static id my_NSStringFromClass(Class aClass) {
     static __thread int reent = 0;            // anti-recursión
@@ -384,6 +399,50 @@ static void **find_got_slot(const char *want) {
         lc += cmd->cmdsize;
     }
     return NULL;
+}
+
+// ════════════════════════════════════════════
+//  MODO 2: SWIZZLING ObjC (métodos de instancia)
+// ════════════════════════════════════════════
+
+// Genérico: intercambia la IMP de un método de instancia.
+// Devuelve la IMP original (para llamarla desde tu trampolín).
+// Si el método es HEREDADO, lo agrega a cls para no pisar al padre.
+static IMP swizzle_instance(Class cls, SEL sel, IMP replacement) {
+    if(!cls || !sel || !replacement) return NULL;
+    Method m = class_getInstanceMethod(cls, sel);
+    if(!m) return NULL;
+    IMP old = method_getImplementation(m);
+    if(!class_addMethod(cls, sel, replacement,
+                        method_getTypeEncoding(m))) {
+        method_setImplementation(m, replacement); // ya estaba en cls
+    }
+    return old;
+}
+
+// Restaura la IMP original de un método de instancia.
+static void unswizzle_instance(Class cls, SEL sel, IMP original) {
+    if(!cls || !sel || !original) return;
+    Method m = class_getInstanceMethod(cls, sel);
+    if(m) method_setImplementation(m, original);
+}
+
+// Swizzle demo: -[UIViewController viewDidAppear:] (firma conocida).
+//   - (void)viewDidAppear:(BOOL)animated;
+typedef void (*vda_t)(id, SEL, BOOL);
+static vda_t orig_vda        = NULL;
+static BOOL  g_demo_swizzled = NO;
+
+static void my_viewDidAppear(id self, SEL _cmd, BOOL animated) {
+    static __thread int reent = 0;
+    if(!reent) {
+        reent = 1;
+        add_log([NSString stringWithFormat:
+            @"  [SWZ] viewDidAppear: %s",
+            object_getClassName(self)]);
+        reent = 0;
+    }
+    if(orig_vda) orig_vda(self, _cmd, animated); // llama al real
 }
 
 // ── Tracer thread — samplea PCs de threads de la app ──
@@ -643,30 +702,70 @@ static void update_ui(void) {
         ^{ read_got(); });
 }
 
++ (void)setButtonTag:(NSInteger)tag title:(NSString*)t {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIButton *b = (UIButton*)[g_panel viewWithTag:tag];
+        [b setTitle:t forState:UIControlStateNormal];
+    });
+}
+
 + (void)installHook {
-    add_log(@"── INSTALANDO HOOK ──");
     dispatch_async(
         dispatch_get_global_queue(
             DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        void **slot = find_got_slot("NSStringFromClass");
-        if(!slot) {
-            add_log(@"[HOOK] slot no encontrado");
-            return;
-        }
-        if(orig_NSStringFromClass) {
-            add_log(@"[HOOK] ya estaba instalado");
-            return;
-        }
-        if(got_hook(slot, (void*)my_NSStringFromClass,
-                    (void**)&orig_NSStringFromClass)) {
-            add_log([NSString stringWithFormat:
-                @"[HOOK] NSStringFromClass @ %p OK",
-                (void*)slot]);
-            add_log(@"[HOOK] navega la app para ver hits");
+        if(!g_demo_hooked) {
+            void **slot = find_got_slot("NSStringFromClass");
+            if(!slot) {
+                add_log(@"[HOOK] slot no encontrado "
+                        @"(toca GOT y reintenta)");
+                return;
+            }
+            if(got_hook(slot, (void*)my_NSStringFromClass,
+                        (void**)&orig_NSStringFromClass)) {
+                g_nsstr_slot  = slot;
+                g_demo_hooked = YES;
+                add_log([NSString stringWithFormat:
+                    @"[HOOK] NSStringFromClass @ %p ON",
+                    (void*)slot]);
+                [self setButtonTag:201 title:@"UNHOOK"];
+            } else {
+                add_log(@"[HOOK] fallo (vm_protect)");
+            }
         } else {
-            add_log(@"[HOOK] fallo (vm_protect)");
+            if(g_nsstr_slot &&
+               got_unhook(g_nsstr_slot,
+                          (void*)orig_NSStringFromClass)) {
+                g_demo_hooked = NO;
+                add_log(@"[HOOK] NSStringFromClass OFF");
+                [self setButtonTag:201 title:@"HOOK"];
+            } else {
+                add_log(@"[HOOK] fallo al quitar");
+            }
         }
     });
+}
+
++ (void)installSwizzle {
+    Class cls = objc_getClass("UIViewController");
+    SEL   sel = @selector(viewDidAppear:);
+    if(!g_demo_swizzled) {
+        IMP old = swizzle_instance(cls, sel,
+                                   (IMP)my_viewDidAppear);
+        if(old) {
+            orig_vda = (vda_t)old;
+            g_demo_swizzled = YES;
+            add_log(@"[SWZ] -[UIViewController "
+                    @"viewDidAppear:] ON");
+            [self setButtonTag:202 title:@"UNSWZ"];
+        } else {
+            add_log(@"[SWZ] método no encontrado");
+        }
+    } else {
+        unswizzle_instance(cls, sel, (IMP)orig_vda);
+        g_demo_swizzled = NO;
+        add_log(@"[SWZ] viewDidAppear: OFF");
+        [self setButtonTag:202 title:@"SWZ"];
+    }
 }
 
 + (void)fabDragged:(UIPanGestureRecognizer*)pan {
@@ -777,30 +876,33 @@ static void build_ui(void) {
     [g_panel addSubview:hdr];
 
     // Botones
-    NSArray *titles  = @[@"TRACE",
-                         @"GOT",
-                         @"CLEAR",
-                         @"HOOK"];
-    NSArray *sels    = @[@"toggleTrace",
-                         @"readGOT",
-                         @"clearLog",
-                         @"installHook"];
+    NSArray *titles  = @[@"TRACE", @"GOT", @"CLEAR",
+                         @"HOOK",  @"SWZ", @"SAVE"];
+    NSArray *sels    = @[@"toggleTrace", @"readGOT", @"clearLog",
+                         @"installHook", @"installSwizzle",
+                         @"saveLog"];
     NSArray *colors  = @[
         [UIColor colorWithRed:0.1 green:0.5
-                        blue:0.1 alpha:1],
+                        blue:0.1 alpha:1],   // TRACE
         [UIColor colorWithRed:0.4 green:0.1
-                    blue:0.5 alpha:1],
+                        blue:0.5 alpha:1],   // GOT
         [UIColor colorWithRed:0.3 green:0.3
-                        blue:0.3 alpha:1],
+                        blue:0.3 alpha:1],   // CLEAR
         [UIColor colorWithRed:0.7 green:0.4
-                        blue:0.05 alpha:1],
+                        blue:0.05 alpha:1],  // HOOK
+        [UIColor colorWithRed:0.05 green:0.5
+                        blue:0.5 alpha:1],   // SWZ
+        [UIColor colorWithRed:0.1 green:0.2
+                        blue:0.6 alpha:1],   // SAVE
     ];
-    CGFloat bw = (pw - 32) / 4.0;
-    for(int i = 0; i < 4; i++) {
+    CGFloat bw = (pw - 28) / 3.0;            // 3 por fila
+    for(int i = 0; i < 6; i++) {
+        int row = i / 3;
+        int col = i % 3;
         UIButton *b = [UIButton
             buttonWithType:UIButtonTypeSystem];
         b.frame = CGRectMake(
-            10 + i*(bw+4), 40, bw, 32);
+            10 + col*(bw+4), 40 + row*36, bw, 32);
         b.backgroundColor = colors[i];
         b.layer.cornerRadius = 6;
         [b setTitle:titles[i]
@@ -813,12 +915,14 @@ static void build_ui(void) {
         [b addTarget:DisasmController.class
               action:NSSelectorFromString(sels[i])
     forControlEvents:UIControlEventTouchUpInside];
-        if(i == 0) b.tag = 200;
+        if(i == 0) b.tag = 200;   // TRACE (toggle PAUSE)
+        if(i == 3) b.tag = 201;   // HOOK  (toggle UNHOOK)
+        if(i == 4) b.tag = 202;   // SWZ   (toggle UNSWZ)
         [g_panel addSubview:b];
     }
 
     // TextView
-    CGFloat tv_y = 80;
+    CGFloat tv_y = 116;
     g_textview = [[UITextView alloc]
         initWithFrame:CGRectMake(
             6, tv_y,
