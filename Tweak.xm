@@ -1,45 +1,33 @@
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
+#include <mach/mach.h>
+#include <mach/thread_act.h>
 #include <mach-o/dyld.h>
-#include <mach-o/nlist.h>
 #include <dlfcn.h>
-#include <execinfo.h>
 #include <stdatomic.h>
 #include <pthread.h>
 
-// ================================================
-// CONFIG
-// ================================================
-#define MAX_FRAMES   32
 #define SAMPLE_MS    150
-#define MAX_LOG      2048
+#define MAX_LOG      1000
 #define LOG_MAX_CHAR (512*1024)
 
-// ================================================
-// ESTADO GLOBAL
-// ================================================
-static UIWindow      *g_window     = nil;
-static UITextView    *g_textview   = nil;
-static UIButton      *g_fab        = nil;
-static UIView        *g_panel      = nil;
-static BOOL           g_expanded   = NO;
-static BOOL           g_tracing    = NO;
-static pthread_t      g_thread;
-static atomic_bool    g_running    = false;
-
+// ── Estado global ──
+static UIWindow        *g_window   = nil;
+static UITextView      *g_textview = nil;
+static UIButton        *g_fab      = nil;
+static UIView          *g_panel    = nil;
+static BOOL             g_expanded = NO;
+static BOOL             g_tracing  = NO;
+static atomic_bool      g_running  = false;
+static pthread_t        g_thread;
 static NSMutableString *g_log      = nil;
 static NSLock          *g_lock     = nil;
+static uint64_t         g_base     = 0;
+static NSString        *g_appname  = nil;
+static pthread_t        g_self_thread;
 
-// Base address de Instagram para resolver offsets
-static uint64_t g_base = 0;
-static NSString *g_bundle_name = nil;
-
-// ================================================
-// HELPERS
-// ================================================
-
-// Encontrar base address de la app target
+// ── Encontrar base de la app target ──
 static void find_base(void) {
     uint32_t count = _dyld_image_count();
     for(uint32_t i = 0; i < count; i++) {
@@ -49,17 +37,14 @@ static void find_base(void) {
         if(strstr(name,"usr/lib"))    continue;
         if(strstr(name,"System"))     continue;
         if(strstr(name,"framework"))  continue;
-        // Primera imagen que no es sistema = app
-        const struct mach_header *mh =
-            _dyld_get_image_header(i);
-        g_base = (uint64_t)mh;
-        g_bundle_name = [NSString stringWithUTF8String:
-            name ?: "?"];
+        g_base = (uint64_t)_dyld_get_image_header(i);
+        g_appname = [[NSString stringWithUTF8String:name]
+            lastPathComponent];
         return;
     }
 }
 
-// Agregar línea al log
+// ── Log ──
 static void add_log(NSString *line) {
     [g_lock lock];
     if(g_log.length > LOG_MAX_CHAR)
@@ -69,143 +54,232 @@ static void add_log(NSString *line) {
     [g_lock unlock];
 }
 
-// ================================================
-// TRACER — sampling thread
-// ================================================
+// ── Tracer thread — samplea PCs de threads de la app ──
 static void *tracer_thread(void *arg) {
-    void *frames[MAX_FRAMES];
+    g_self_thread = pthread_self();
 
     while(atomic_load(&g_running)) {
         if(g_tracing) {
-            int n = backtrace(frames, MAX_FRAMES);
+            thread_array_t threads;
+            mach_msg_type_number_t count;
+            kern_return_t kr =
+                task_threads(mach_task_self(),
+                             &threads, &count);
+            if(kr != KERN_SUCCESS) {
+                usleep(SAMPLE_MS * 1000);
+                continue;
+            }
 
             NSMutableString *entry =
                 [NSMutableString new];
 
-            for(int i = 1; i < n && i < 8; i++) {
-                uint64_t addr = (uint64_t)frames[i];
+            for(uint32_t t = 0; t < count; t++) {
+                // ── Filtrar nuestro propio thread ──
+                pthread_t pt = NULL;
+                pthread_from_mach_thread_np(
+                    threads[t], &pt);
+                if(pt == g_self_thread) continue;
 
-                // Intentar resolver símbolo con dladdr
+                // Obtener PC del thread
+                arm_thread_state64_t state;
+                mach_msg_type_number_t sc =
+                    ARM_THREAD_STATE64_COUNT;
+                kr = thread_get_state(
+                    threads[t],
+                    ARM_THREAD_STATE64,
+                    (thread_state_t)&state,
+                    &sc);
+                if(kr != KERN_SUCCESS) continue;
+
+                uint64_t pc =
+                    arm_thread_state64_get_pc(state);
+                if(pc == 0) continue;
+
+                // ── Filtrar threads del sistema ──
+                // Solo mostrar PCs dentro del
+                // rango del binario de la app
+                // o dylibs conocidas
                 Dl_info info;
-                if(dladdr(frames[i], &info) &&
-                   info.dli_sname) {
-                    // Tiene símbolo
-                    [entry appendFormat:
-                        @"  [%d] %s\n",
-                        i, info.dli_sname];
+                if(!dladdr((void*)pc, &info)) continue;
+
+                // Saltar si es del sistema
+                const char *fname =
+                    info.dli_fname ?: "";
+                if(strstr(fname,"usr/lib"))   continue;
+                if(strstr(fname,"System"))    continue;
+                if(strstr(fname,"framework") &&
+                   !strstr(fname,"instagram") &&
+                   !strstr(fname,"Instagram")) continue;
+                if(strstr(fname,"LiveProcess"))continue;
+
+                // Resolver nombre
+                NSString *sym;
+                if(info.dli_sname) {
+                    // Tiene símbolo — truncar si es largo
+                    NSString *full = [NSString
+                        stringWithUTF8String:
+                        info.dli_sname];
+                    sym = full.length > 60 ?
+                        [full substringToIndex:60] :
+                        full;
                 } else {
-                    // Sin símbolo — mostrar offset
-                    // relativo a la base de la app
-                    uint64_t offset =
-                        addr > g_base ?
-                        addr - g_base : addr;
-                    [entry appendFormat:
-                        @"  [%d] 0x%llx\n",
-                        i, offset];
+                    // Sin símbolo — offset relativo
+                    uint64_t off = g_base ?
+                        pc - g_base : pc;
+                    sym = [NSString stringWithFormat:
+                        @"+0x%llx", off];
                 }
+
+                [entry appendFormat:
+                    @"  [t%u] %@\n", t, sym];
             }
 
             if(entry.length > 0) {
-                NSString *ts = [NSString
-                    stringWithFormat:@"─── %@",
-                    [[NSDate date] descriptionWithLocale:nil]];
-                add_log(ts);
+                // Timestamp corto
+                NSDateFormatter *df =
+                    [NSDateFormatter new];
+                df.dateFormat = @"HH:mm:ss.SSS";
+                NSString *ts = [df stringFromDate:
+                    [NSDate date]];
+                add_log([NSString stringWithFormat:
+                    @"─ %@", ts]);
                 add_log(entry);
             }
-        }
 
-        // Sleep SAMPLE_MS milisegundos
+            vm_deallocate(mach_task_self(),
+                (vm_address_t)threads,
+                count * sizeof(thread_act_t));
+        }
         usleep(SAMPLE_MS * 1000);
     }
     return NULL;
 }
 
-// ================================================
-// UI — actualizar textview desde main thread
-// ================================================
+// ── Actualizar UI ──
 static void update_ui(void) {
     if(!g_expanded || !g_textview) return;
     [g_lock lock];
     NSString *text = [g_log copy];
     [g_lock unlock];
 
-    // Mostrar las últimas líneas
     NSArray *lines =
         [text componentsSeparatedByString:@"\n"];
-    NSInteger start =
-        lines.count > MAX_LOG ?
+    NSInteger start = lines.count > MAX_LOG ?
         lines.count - MAX_LOG : 0;
-    NSArray *recent =
-        [lines subarrayWithRange:
-            NSMakeRange(start,
-                lines.count - start)];
     NSString *display =
-        [recent componentsJoinedByString:@"\n"];
+        [[lines subarrayWithRange:
+            NSMakeRange(start, lines.count-start)]
+         componentsJoinedByString:@"\n"];
 
-    g_textview.text = display;
-
-    // Scroll al final
-    if(display.length > 0) {
-        NSRange r = NSMakeRange(
-            display.length - 1, 1);
-        [g_textview scrollRangeToVisible:r];
-    }
+    dispatch_async(dispatch_get_main_queue(), ^{
+        g_textview.text = display;
+        if(display.length > 0)
+            [g_textview scrollRangeToVisible:
+                NSMakeRange(display.length-1, 1)];
+    });
 }
 
-// ================================================
-// ACTIONS
-// ================================================
-@interface DisasmController : NSObject
-+ (void)togglePanel;
-+ (void)toggleTrace;
-+ (void)clearLog;
-+ (void)saveLog;
-+ (void)fabDragged:(UIPanGestureRecognizer*)pan;
+// ── Passthrough Window ──
+@interface PassthroughWindow : UIWindow
 @end
 
+@implementation PassthroughWindow
+- (UIView *)hitTest:(CGPoint)point
+          withEvent:(UIEvent *)event {
+    // FAB
+    if(g_fab && !g_fab.hidden) {
+        CGPoint p = [self convertPoint:point
+                                toView:g_fab];
+        if([g_fab pointInside:p withEvent:event])
+            return g_fab;
+    }
+    // Panel abierto
+    if(g_panel && g_expanded && !g_panel.hidden) {
+        CGPoint p = [self convertPoint:point
+                                toView:g_panel];
+        if([g_panel pointInside:p withEvent:event])
+            return [g_panel hitTest:p
+                          withEvent:event] ?: g_panel;
+        // Toque FUERA del panel — cerrar
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if(g_expanded) {
+                g_expanded = NO;
+                [UIView animateWithDuration:0.2
+                                 animations:^{
+                    g_panel.alpha = 0;
+                } completion:^(BOOL done){
+                    g_panel.hidden = YES;
+                }];
+                [g_fab setTitle:@"⚙"
+                       forState:UIControlStateNormal];
+            }
+        });
+    }
+    return nil;
+}
+@end
+
+// ── Acciones ──
+@interface DisasmController : NSObject
+@end
 @implementation DisasmController
 
 + (void)togglePanel {
     g_expanded = !g_expanded;
-    [UIView animateWithDuration:0.25 animations:^{
-        g_panel.alpha = g_expanded ? 1.0 : 0.0;
-        g_panel.hidden = !g_expanded;
-    }];
-    [g_fab setTitle:g_expanded ? @"✕" : @"⚙"
-           forState:UIControlStateNormal];
+    if(g_expanded) {
+        g_panel.hidden = NO;
+        g_panel.alpha  = 0;
+        [UIView animateWithDuration:0.2 animations:^{
+            g_panel.alpha = 1;
+        }];
+        [g_fab setTitle:@"✕"
+               forState:UIControlStateNormal];
+    } else {
+        [UIView animateWithDuration:0.2
+                         animations:^{
+            g_panel.alpha = 0;
+        } completion:^(BOOL done){
+            g_panel.hidden = YES;
+        }];
+        [g_fab setTitle:@"⚙"
+               forState:UIControlStateNormal];
+    }
 }
 
 + (void)toggleTrace {
     g_tracing = !g_tracing;
-
     UIButton *btn = (UIButton*)
         [g_panel viewWithTag:200];
-    [btn setTitle:g_tracing ?
-        @"⏸ PAUSE" : @"▶ TRACE"
-        forState:UIControlStateNormal];
-    [btn setBackgroundColor:g_tracing ?
-        [UIColor colorWithRed:0.8
-                        green:0.2
-                         blue:0.2
-                        alpha:1] :
-        [UIColor colorWithRed:0.1
-                        green:0.6
-                         blue:0.1
-                        alpha:1]];
+    NSString *title = g_tracing ?
+        @"⏸ PAUSE" : @"▶ TRACE";
+    UIColor *color = g_tracing ?
+        [UIColor colorWithRed:0.7 green:0.1
+                        blue:0.1 alpha:1] :
+        [UIColor colorWithRed:0.1 green:0.5
+                        blue:0.1 alpha:1];
+    [btn setTitle:title
+         forState:UIControlStateNormal];
+    btn.backgroundColor = color;
+    if(!g_tracing) {
+        add_log(@"── PAUSADO ──");
+    } else {
+        add_log(@"── TRACE INICIADO ──");
+    }
 }
 
 + (void)clearLog {
     [g_lock lock];
     [g_log setString:@""];
     [g_lock unlock];
-    g_textview.text = @"";
+    dispatch_async(dispatch_get_main_queue(), ^{
+        g_textview.text = @"";
+    });
 }
 
 + (void)saveLog {
     [g_lock lock];
     NSString *text = [g_log copy];
     [g_lock unlock];
-
     NSString *docs =
         NSSearchPathForDirectoriesInDomains(
             NSDocumentDirectory,
@@ -213,117 +287,84 @@ static void update_ui(void) {
     NSString *path =
         [docs stringByAppendingPathComponent:
             @"live_trace.txt"];
-    [text writeToFile:path
-           atomically:YES
+    [text writeToFile:path atomically:YES
              encoding:NSUTF8StringEncoding
                 error:nil];
-
-    UIAlertController *a =
-        [UIAlertController
-            alertControllerWithTitle:@"Guardado"
-                message:path
-         preferredStyle:UIAlertControllerStyleAlert];
-    [a addAction:[UIAlertAction
-        actionWithTitle:@"OK"
-                  style:UIAlertActionStyleDefault
-                handler:nil]];
-    UIViewController *root =
-        g_window.rootViewController;
-    [root presentViewController:a
-                       animated:YES
-                     completion:nil];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIAlertController *a =
+            [UIAlertController
+                alertControllerWithTitle:@"Guardado"
+                                 message:path
+                          preferredStyle:
+                            UIAlertControllerStyleAlert];
+        [a addAction:[UIAlertAction
+            actionWithTitle:@"OK"
+                      style:UIAlertActionStyleDefault
+                    handler:nil]];
+        UIViewController *root =
+            g_window.rootViewController;
+        while(root.presentedViewController)
+            root = root.presentedViewController;
+        [root presentViewController:a
+                           animated:YES
+                         completion:nil];
+    });
 }
 
 + (void)fabDragged:(UIPanGestureRecognizer*)pan {
     CGPoint t = [pan translationInView:g_window];
-    g_fab.center = CGPointMake(
+    CGPoint newCenter = CGPointMake(
         g_fab.center.x + t.x,
         g_fab.center.y + t.y);
+    // Mantener dentro de la pantalla
+    CGFloat r = g_fab.bounds.size.width / 2;
+    CGRect  b = g_window.bounds;
+    newCenter.x = MAX(r, MIN(b.size.width-r,
+                             newCenter.x));
+    newCenter.y = MAX(r+44, MIN(b.size.height-r,
+                               newCenter.y));
+    g_fab.center = newCenter;
     [pan setTranslation:CGPointZero
                  inView:g_window];
 }
 
 @end
 
-
-// ── Window que pasa toques a la app ──
-@interface PassthroughWindow : UIWindow
-@end
-
-@implementation PassthroughWindow
-
-- (UIView *)hitTest:(CGPoint)point
-          withEvent:(UIEvent *)event {
-    // Verificar si el punto toca el FAB
-    if(g_fab && !g_fab.hidden) {
-        CGPoint fabPoint = [self convertPoint:point
-                                       toView:g_fab];
-        if([g_fab pointInside:fabPoint
-                    withEvent:event]) {
-            return g_fab;
-        }
-    }
-    // Verificar si el punto toca el panel
-    if(g_panel && !g_panel.hidden &&
-       !g_panel.isHidden && g_expanded) {
-        CGPoint panelPoint = [self convertPoint:point
-                                         toView:g_panel];
-        if([g_panel pointInside:panelPoint
-                      withEvent:event]) {
-            return [g_panel hitTest:panelPoint
-                          withEvent:event] ?: g_panel;
-        }
-    }
-    // Todo lo demás pasa a la app
-    return nil;
-}
-
-@end
-
-
-
-// ================================================
-// BUILD UI
-// ================================================
+// ── Build UI ──
 static void build_ui(void) {
     CGRect screen = UIScreen.mainScreen.bounds;
     CGFloat W = screen.size.width;
     CGFloat H = screen.size.height;
 
-    // ── Ventana overlay ──
     g_window = [[PassthroughWindow alloc]
         initWithFrame:screen];
     g_window.windowLevel =
         UIWindowLevelAlert + 200;
-    g_window.backgroundColor =
-        [UIColor clearColor];
-    g_window.userInteractionEnabled = YES;
+    g_window.backgroundColor = UIColor.clearColor;
 
-    UIViewController *vc =
-        [UIViewController new];
-    vc.view.backgroundColor =
-        [UIColor clearColor];
+    UIViewController *vc = [UIViewController new];
+    vc.view.backgroundColor = UIColor.clearColor;
     g_window.rootViewController = vc;
 
-    // ── FAB (botón flotante) ──
-    CGFloat fab_size = 52;
+    // ── FAB ──
+    CGFloat fab_sz = 52;
     g_fab = [[UIButton alloc]
         initWithFrame:CGRectMake(
-            W - fab_size - 16,
-            H * 0.4,
-            fab_size, fab_size)];
+            W - fab_sz - 12,
+            H * 0.38,
+            fab_sz, fab_sz)];
     g_fab.backgroundColor =
         [UIColor colorWithRed:0
-                        green:0.8
-                         blue:0.4
-                        alpha:0.92];
-    g_fab.layer.cornerRadius = fab_size/2;
+                        green:0.85
+                         blue:0.45
+                        alpha:0.93];
+    g_fab.layer.cornerRadius = fab_sz / 2;
     g_fab.layer.shadowColor  =
-        [UIColor blackColor].CGColor;
-    g_fab.layer.shadowOpacity = 0.4;
-    g_fab.layer.shadowRadius  = 6;
+        UIColor.blackColor.CGColor;
+    g_fab.layer.shadowOpacity = 0.5;
+    g_fab.layer.shadowRadius  = 8;
     g_fab.layer.shadowOffset  =
-        CGSizeMake(0, 3);
+        CGSizeMake(0, 4);
     [g_fab setTitle:@"⚙"
            forState:UIControlStateNormal];
     g_fab.titleLabel.font =
@@ -331,106 +372,95 @@ static void build_ui(void) {
                           weight:UIFontWeightBold];
     [g_fab setTitleColor:UIColor.blackColor
                 forState:UIControlStateNormal];
-
-    // Touch handler
     [g_fab addTarget:DisasmController.class
               action:@selector(togglePanel)
     forControlEvents:UIControlEventTouchUpInside];
 
-    // Drag
     UIPanGestureRecognizer *pan =
         [[UIPanGestureRecognizer alloc]
             initWithTarget:DisasmController.class
                     action:@selector(fabDragged:)];
     [g_fab addGestureRecognizer:pan];
-
     [g_window addSubview:g_fab];
 
     // ── Panel ──
-    CGFloat pw = W - 32;
-    CGFloat ph = H * 0.65;
+    CGFloat pw = W - 24;
+    CGFloat ph = H * 0.6;
     g_panel = [[UIView alloc]
         initWithFrame:CGRectMake(
-            16, H - ph - 16,
-            pw, ph)];
+            12, H - ph - 20, pw, ph)];
     g_panel.backgroundColor =
-        [UIColor colorWithRed:0.05
-                        green:0.05
-                         blue:0.05
-                        alpha:0.96];
-    g_panel.layer.cornerRadius = 12;
+        [UIColor colorWithRed:0.04
+                        green:0.04
+                         blue:0.04
+                        alpha:0.97];
+    g_panel.layer.cornerRadius = 14;
     g_panel.layer.borderWidth  = 1;
     g_panel.layer.borderColor  =
         [UIColor colorWithRed:0
-                        green:0.8
-                         blue:0.4
-                        alpha:0.5].CGColor;
+                        green:0.85
+                         blue:0.45
+                        alpha:0.4].CGColor;
     g_panel.hidden = YES;
     g_panel.alpha  = 0;
 
     // Header
-    UILabel *header = [UILabel new];
-    header.frame = CGRectMake(12, 10, pw-24, 28);
-    header.text = [NSString stringWithFormat:
-        @"LIVE TRACER — %@",
-        g_bundle_name.lastPathComponent];
-    header.font = [UIFont
-        monospacedSystemFontOfSize:11
-                            weight:UIFontWeightBold];
-    header.textColor =
+    UILabel *hdr = [UILabel new];
+    hdr.frame = CGRectMake(12, 12, pw-24, 22);
+    hdr.text = [NSString stringWithFormat:
+        @"◈ LIVE TRACER — %@", g_appname ?: @"app"];
+    hdr.font = [UIFont monospacedSystemFontOfSize:11
+                                           weight:UIFontWeightBold];
+    hdr.textColor =
         [UIColor colorWithRed:0
-                        green:0.8
-                         blue:0.4
+                        green:0.85
+                         blue:0.45
                         alpha:1];
-    [g_panel addSubview:header];
+    [g_panel addSubview:hdr];
 
-    // Barra de botones
-    CGFloat bw = (pw - 24) / 3.0;
-    NSArray *btnTitles =
-        @[@"▶ TRACE", @"🗑 CLEAR", @"💾 SAVE"];
-    NSArray *btnSels = @[
-        @"toggleTrace",
-        @"clearLog",
-        @"saveLog"
-    ];
-    NSArray *btnColors = @[
-        [UIColor colorWithRed:0.1 green:0.6
+    // Botones
+    NSArray *titles  = @[@"▶ TRACE",
+                         @"🗑 CLEAR",
+                         @"💾 SAVE"];
+    NSArray *sels    = @[@"toggleTrace",
+                         @"clearLog",
+                         @"saveLog"];
+    NSArray *colors  = @[
+        [UIColor colorWithRed:0.1 green:0.5
                         blue:0.1 alpha:1],
-        [UIColor colorWithRed:0.5 green:0.5
-                        blue:0.5 alpha:1],
-        [UIColor colorWithRed:0.1 green:0.3
-                        blue:0.7 alpha:1],
+        [UIColor colorWithRed:0.3 green:0.3
+                        blue:0.3 alpha:1],
+        [UIColor colorWithRed:0.1 green:0.2
+                        blue:0.6 alpha:1],
     ];
-
+    CGFloat bw = (pw - 28) / 3.0;
     for(int i = 0; i < 3; i++) {
         UIButton *b = [UIButton
             buttonWithType:UIButtonTypeSystem];
         b.frame = CGRectMake(
-            12 + i * (bw + 4), 44,
-            bw, 34);
-        b.backgroundColor = btnColors[i];
+            10 + i*(bw+4), 40, bw, 32);
+        b.backgroundColor = colors[i];
         b.layer.cornerRadius = 6;
-        [b setTitle:btnTitles[i]
+        [b setTitle:titles[i]
            forState:UIControlStateNormal];
         [b setTitleColor:UIColor.whiteColor
                 forState:UIControlStateNormal];
         b.titleLabel.font =
             [UIFont monospacedSystemFontOfSize:10
                                         weight:UIFontWeightBold];
-        SEL sel = NSSelectorFromString(btnSels[i]);
         [b addTarget:DisasmController.class
-              action:sel
+              action:NSSelectorFromString(sels[i])
     forControlEvents:UIControlEventTouchUpInside];
         if(i == 0) b.tag = 200;
         [g_panel addSubview:b];
     }
 
-    // TextView para el log
-    CGFloat tv_y = 88;
+    // TextView
+    CGFloat tv_y = 80;
     g_textview = [[UITextView alloc]
         initWithFrame:CGRectMake(
-            8, tv_y,
-            pw - 16, ph - tv_y - 8)];
+            6, tv_y,
+            pw-12, ph-tv_y-8)];
     g_textview.backgroundColor =
         [UIColor colorWithRed:0.02
                         green:0.02
@@ -445,53 +475,47 @@ static void build_ui(void) {
         [UIFont monospacedSystemFontOfSize:9
                                     weight:UIFontWeightRegular];
     g_textview.editable = NO;
-    g_textview.layer.cornerRadius = 6;
+    g_textview.layer.cornerRadius = 8;
     g_textview.text =
-        @"// Presiona TRACE para iniciar\n"
-        @"// Se muestran los call stacks en vivo\n";
+        @"// Toca TRACE para iniciar\n"
+        @"// Solo threads de la app target\n";
     [g_panel addSubview:g_textview];
-
     [g_window addSubview:g_panel];
     [g_window makeKeyAndVisible];
 
-    // Timer para actualizar UI cada 500ms
-    [NSTimer scheduledTimerWithTimeInterval:0.5
-                                     target:[NSBlockOperation
-                                        blockOperationWithBlock:^{
+    // Timer UI refresh
+    NSTimer *timer = [NSTimer
+        scheduledTimerWithTimeInterval:0.5
+                               repeats:YES
+                                 block:^(NSTimer *t){
         update_ui();
-    }]
-                                   selector:@selector(main)
-                                   userInfo:nil
-                                    repeats:YES];
+    }];
+    [[NSRunLoop mainRunLoop] addTimer:timer
+                              forMode:NSRunLoopCommonModes];
 }
 
-// ================================================
-// CTOR
-// ================================================
+// ── CTOR ──
 %ctor {
     g_log  = [NSMutableString new];
     g_lock = [NSLock new];
 
     find_base();
 
-    // Info inicial en el log
     add_log([NSString stringWithFormat:
         @"Bundle: %@",
         NSBundle.mainBundle.bundleIdentifier]);
     add_log([NSString stringWithFormat:
         @"Base:   0x%llx", g_base]);
     add_log([NSString stringWithFormat:
-        @"PID:    %d", getpid()]);
+        @"App:    %@", g_appname ?: @"?"]);
     add_log(@"─────────────────────────");
-    add_log(@"Listo para trazar");
+    add_log(@"Ready. Toca TRACE.");
 
-    // Iniciar thread del tracer
     atomic_store(&g_running, true);
     pthread_create(&g_thread, NULL,
                    tracer_thread, NULL);
     pthread_detach(g_thread);
 
-    // Build UI en main thread
     dispatch_after(
         dispatch_time(DISPATCH_TIME_NOW,
             (int64_t)(3 * NSEC_PER_SEC)),
@@ -499,6 +523,4 @@ static void build_ui(void) {
         build_ui();
     });
 }
-
-
 
