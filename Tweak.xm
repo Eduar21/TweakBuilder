@@ -236,18 +236,20 @@ static void read_got(void) {
                             sym = demangle(
                                 info.dli_sname);
                         } else if(info.dli_fname) {
-                            sym = [NSString
-                                stringWithFormat:
-                                @"(%s)+0x%llx",
-                                [[NSString
-                                    stringWithUTF8String:
-                                    info.dli_fname]
-                                    lastPathComponent
-                                    .UTF8String],
-                                ptr_val -
-                                (uint64_t)
-                                info.dli_fbase];
-                        }
+                            } else if(info.dli_fname) {
+    NSString *fn = [NSString
+        stringWithUTF8String:
+        info.dli_fname];
+    NSString *base =
+        fn.lastPathComponent;
+    uint64_t off = ptr_val -
+        (uint64_t)info.dli_fbase;
+    sym = [NSString
+        stringWithFormat:
+        @"(%@)+0x%llx",
+        base, off];
+}
+
                     }
 
                     add_log([NSString
