@@ -254,18 +254,32 @@ static void update_ui(void) {
 
 - (UIView *)hitTest:(CGPoint)point
           withEvent:(UIEvent *)event {
-    UIView *hit = [super hitTest:point
-                       withEvent:event];
-    // Si el hit es la ventana o el vc root
-    // pasar el toque a la app debajo
-    if(hit == self ||
-       hit == self.rootViewController.view) {
-        return nil;
+    // Verificar si el punto toca el FAB
+    if(g_fab && !g_fab.hidden) {
+        CGPoint fabPoint = [self convertPoint:point
+                                       toView:g_fab];
+        if([g_fab pointInside:fabPoint
+                    withEvent:event]) {
+            return g_fab;
+        }
     }
-    return hit;
+    // Verificar si el punto toca el panel
+    if(g_panel && !g_panel.hidden &&
+       !g_panel.isHidden && g_expanded) {
+        CGPoint panelPoint = [self convertPoint:point
+                                         toView:g_panel];
+        if([g_panel pointInside:panelPoint
+                      withEvent:event]) {
+            return [g_panel hitTest:panelPoint
+                          withEvent:event] ?: g_panel;
+        }
+    }
+    // Todo lo demás pasa a la app
+    return nil;
 }
 
 @end
+
 
 
 // ================================================
@@ -485,5 +499,6 @@ static void build_ui(void) {
         build_ui();
     });
 }
+
 
 
