@@ -75,11 +75,9 @@ static void *tracer_thread(void *arg) {
 
             for(uint32_t t = 0; t < count; t++) {
                 // ── Filtrar nuestro propio thread ──
-                pthread_t pt = NULL;
-                pthread_from_mach_thread_np(
-                    threads[t], &pt);
-                if(pt == g_self_thread) continue;
-
+                pthread_t pt =
+    pthread_from_mach_thread_np(threads[t]);
+if(pt == g_self_thread) continue;
                 // Obtener PC del thread
                 arm_thread_state64_t state;
                 mach_msg_type_number_t sc =
