@@ -245,6 +245,29 @@ static void update_ui(void) {
 
 @end
 
+
+// ── Window que pasa toques a la app ──
+@interface PassthroughWindow : UIWindow
+@end
+
+@implementation PassthroughWindow
+
+- (UIView *)hitTest:(CGPoint)point
+          withEvent:(UIEvent *)event {
+    UIView *hit = [super hitTest:point
+                       withEvent:event];
+    // Si el hit es la ventana o el vc root
+    // pasar el toque a la app debajo
+    if(hit == self ||
+       hit == self.rootViewController.view) {
+        return nil;
+    }
+    return hit;
+}
+
+@end
+
+
 // ================================================
 // BUILD UI
 // ================================================
@@ -254,7 +277,7 @@ static void build_ui(void) {
     CGFloat H = screen.size.height;
 
     // ── Ventana overlay ──
-    g_window = [[UIWindow alloc]
+    g_window = [[PassthroughWindow alloc]
         initWithFrame:screen];
     g_window.windowLevel =
         UIWindowLevelAlert + 200;
@@ -462,3 +485,4 @@ static void build_ui(void) {
         build_ui();
     });
 }
+
