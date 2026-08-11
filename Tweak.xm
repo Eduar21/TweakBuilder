@@ -318,26 +318,6 @@ static bool got_unhook(void **slot, void *original) {
     return got_write(slot, original);
 }
 
-// Hook demo: NSStringFromClass (firma CONOCIDA -> PoC seguro).
-//   NSString *NSStringFromClass(Class aClass);
-typedef id (*NSStringFromClass_t)(Class);
-static NSStringFromClass_t orig_NSStringFromClass = NULL;
-static void **g_nsstr_slot   = NULL;   // slot guardado, para unhook
-static BOOL   g_demo_hooked  = NO;
-
-static id my_NSStringFromClass(Class aClass) {
-    static __thread int reent = 0;            // anti-recursión
-    if(!reent) {
-        reent = 1;
-        const char *n = aClass ?
-            class_getName(aClass) : "(null)";
-        add_log([NSString stringWithFormat:
-            @"  [HOOK] NSStringFromClass(%s)", n]);
-        reent = 0;
-    }
-    return orig_NSStringFromClass(aClass);     // llama al real
-}
-
 // ── Force-0 genérico: neutraliza una función C por GOT ──
 // Fuerza el retorno a 0/NO. Sirve para checks anti-tamper que
 // devuelven BOOL/int/puntero. NO llama al original: por eso el
@@ -1219,6 +1199,4 @@ static void build_ui(void) {
         build_ui();
     });
 }
-
-
 
