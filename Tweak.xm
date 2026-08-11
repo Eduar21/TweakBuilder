@@ -7,6 +7,7 @@
 #include <dlfcn.h>
 #include <stdatomic.h>
 #include <pthread.h>
+#include <mach-o/loader.h>
 
 #define SAMPLE_MS    150
 #define MAX_LOG      1000
@@ -132,6 +133,145 @@ static NSString *categorize(NSString *sym) {
 
     return @"◆";
 }
+
+// ── Leer GOT de la app target ──
+static void read_got(void) {
+    add_log(@"═══ GOT READER ═══");
+
+    // Encontrar el índice de la imagen target
+    uint32_t target_idx = 0;
+    uint32_t count = _dyld_image_count();
+    for(uint32_t i = 0; i < count; i++) {
+        const char *name = _dyld_get_image_name(i);
+        if(!name) continue;
+        if(strstr(name,"LiveProcess")) continue;
+        if(strstr(name,"usr/lib"))    continue;
+        if(strstr(name,"System"))     continue;
+        if(strstr(name,"framework") &&
+           !strstr(name,"Instagram")) continue;
+        target_idx = i;
+        break;
+    }
+
+    const struct mach_header_64 *mh =
+        (const struct mach_header_64 *)
+        _dyld_get_image_header(target_idx);
+    intptr_t slide =
+        _dyld_get_image_vmaddr_slide(target_idx);
+
+    if(!mh) {
+        add_log(@"ERROR: no encontré header");
+        return;
+    }
+
+    add_log([NSString stringWithFormat:
+        @"Header: 0x%llx slide: 0x%llx",
+        (uint64_t)mh, (uint64_t)slide]);
+
+    // Iterar load commands buscando __got
+    uint8_t *lc = (uint8_t *)mh +
+        sizeof(struct mach_header_64);
+
+    int got_count = 0;
+
+    for(uint32_t i = 0; i < mh->ncmds; i++) {
+        struct load_command *cmd =
+            (struct load_command *)lc;
+
+        if(cmd->cmd == LC_SEGMENT_64) {
+            struct segment_command_64 *seg =
+                (struct segment_command_64 *)lc;
+            struct section_64 *sec =
+                (struct section_64 *)(lc +
+                sizeof(struct segment_command_64));
+
+            for(uint32_t j = 0;
+                j < seg->nsects; j++) {
+
+                // Buscar __got y __la_symbol_ptr
+                BOOL is_got =
+                    strncmp(sec[j].sectname,
+                            "__got", 5) == 0;
+                BOOL is_stubs =
+                    strncmp(sec[j].sectname,
+                            "__la_symbol_ptr",
+                            15) == 0;
+
+                if(!is_got && !is_stubs) {
+                    sec++;
+                    continue;
+                }
+
+                add_log([NSString stringWithFormat:
+                    @"\n[%s] addr=0x%llx "
+                    @"size=%llu entries=%llu",
+                    sec[j].sectname,
+                    sec[j].addr + slide,
+                    sec[j].size,
+                    sec[j].size / 8]);
+
+                // Leer primeras 20 entradas
+                uint64_t *got_ptr =
+                    (uint64_t *)(uintptr_t)
+                    (sec[j].addr + slide);
+                uint64_t n_entries =
+                    sec[j].size / 8;
+                if(n_entries > 20)
+                    n_entries = 20;
+
+                for(uint64_t k = 0;
+                    k < n_entries; k++) {
+                    uint64_t ptr_val = got_ptr[k];
+                    if(ptr_val == 0) {
+                        sec++;
+                        continue;
+                    }
+
+                    // Resolver a qué apunta
+                    Dl_info info;
+                    NSString *sym = @"?";
+                    if(dladdr((void*)ptr_val,
+                               &info)) {
+                        if(info.dli_sname) {
+                            sym = demangle(
+                                info.dli_sname);
+                        } else if(info.dli_fname) {
+                            sym = [NSString
+                                stringWithFormat:
+                                @"(%s)+0x%llx",
+                                [[NSString
+                                    stringWithUTF8String:
+                                    info.dli_fname]
+                                    lastPathComponent
+                                    .UTF8String],
+                                ptr_val -
+                                (uint64_t)
+                                info.dli_fbase];
+                        }
+                    }
+
+                    add_log([NSString
+                        stringWithFormat:
+                        @"  [%02llu] 0x%llx"
+                        @" → %@",
+                        k,
+                        (uint64_t)
+                        &got_ptr[k],
+                        sym]);
+                    got_count++;
+                }
+                sec++;
+            }
+        }
+        lc += cmd->cmdsize;
+    }
+
+    add_log([NSString stringWithFormat:
+        @"\nTotal entradas mostradas: %d",
+        got_count]);
+    add_log(@"═══════════════════");
+}
+
 
 // ── Tracer thread — samplea PCs de threads de la app ──
 static void *tracer_thread(void *arg) {
@@ -382,6 +522,14 @@ static void update_ui(void) {
     });
 }
 
++ (void)readGOT {
+    add_log(@"Leyendo GOT...");
+    dispatch_async(
+        dispatch_get_global_queue(
+            DISPATCH_QUEUE_PRIORITY_DEFAULT, 0),
+        ^{ read_got(); });
+}
+
 + (void)fabDragged:(UIPanGestureRecognizer*)pan {
     CGPoint t = [pan translationInView:g_window];
     CGPoint newCenter = CGPointMake(
@@ -491,14 +639,18 @@ static void build_ui(void) {
 
     // Botones
     NSArray *titles  = @[@"▶ TRACE",
+                         @"📋 GOT",
                          @"🗑 CLEAR",
                          @"💾 SAVE"];
     NSArray *sels    = @[@"toggleTrace",
+                         @"readGOT",
                          @"clearLog",
                          @"saveLog"];
     NSArray *colors  = @[
         [UIColor colorWithRed:0.1 green:0.5
                         blue:0.1 alpha:1],
+        [UIColor colorWithRed:0.4 green:0.1
+                    blue:0.5 alpha:1],
         [UIColor colorWithRed:0.3 green:0.3
                         blue:0.3 alpha:1],
         [UIColor colorWithRed:0.1 green:0.2
@@ -594,5 +746,4 @@ static void build_ui(void) {
         build_ui();
     });
 }
-
 
