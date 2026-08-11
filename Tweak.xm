@@ -1,6 +1,7 @@
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
+#import <objc/runtime.h>
 #include <mach/mach.h>
 #include <mach/thread_act.h>
 #include <mach-o/dyld.h>
@@ -106,18 +107,18 @@ static NSString *categorize(NSString *sym) {
        [sym containsString:@"IOBuf"] ||
        [sym containsString:@"http"] ||
        [sym containsString:@"HTTP"])
-        return @"🌐";
+        return @"[NET]";
 
     if([sym containsString:@"IG"] ||
        [sym containsString:@"Instagram"])
-        return @"📷";
+        return @"[IG ]";
 
     if([sym containsString:@"UI"] ||
        [sym containsString:@"View"] ||
        [sym containsString:@"Layout"] ||
        [sym containsString:@"render"] ||
        [sym containsString:@"Render"])
-        return @"🎨";
+        return @"[UI ]";
 
     if([sym containsString:@"facebook"] ||
        [sym containsString:@"Facebook"] ||
@@ -125,13 +126,13 @@ static NSString *categorize(NSString *sym) {
        [sym containsString:@"Folly"] ||
        [sym containsString:@"MCF"] ||
        [sym containsString:@"XPlugin"])
-        return @"⚙️";
+        return @"[FB ]";
 
     if([sym containsString:@"swift"] ||
        [sym containsString:@"Swift"])
-        return @"🔶";
+        return @"[SW ]";
 
-    return @"◆";
+    return @"[ . ]";
 }
 
 // ── Leer GOT de la app target ──
@@ -237,7 +238,7 @@ static void read_got(void) {
                                 info.dli_sname);
                         } else if(info.dli_fname) {
                             } else if(info.dli_fname) {
-    NSString *fn = [NSString
+                                NSString *fn = [NSString
         stringWithUTF8String:
         info.dli_fname];
     NSString *base =
@@ -274,6 +275,116 @@ static void read_got(void) {
     add_log(@"═══════════════════");
 }
 
+
+// ════════════════════════════════════════════
+//  HOOK POR REDIRECCIÓN DE GOT
+// ════════════════════════════════════════════
+
+// Núcleo: sobrescribe un slot del GOT y devuelve el original.
+static bool got_hook(void **slot, void *replacement,
+                     void **out_original) {
+    if(!slot) return false;
+    if(out_original) *out_original = *slot;   // guarda el real
+
+    mach_port_t task = mach_task_self();
+    // En Apple Silicon la página es de 16KB: usa vm_page_size.
+    vm_address_t page = (vm_address_t)slot &
+        ~((vm_address_t)vm_page_size - 1);
+
+    // __got vive en __DATA_CONST (RO tras los fixups de dyld).
+    // VM_PROT_COPY fuerza una copia privada -> el write no faulta.
+    // Es el mismo truco que fishhook para __DATA_CONST.
+    kern_return_t kr = vm_protect(task, page, vm_page_size,
+        false, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    if(kr != KERN_SUCCESS) return false;
+
+    *slot = replacement;                      // pisa el slot
+
+    // Restaura RO (opcional; los reads siguen permitidos).
+    vm_protect(task, page, vm_page_size, false, VM_PROT_READ);
+    return true;
+}
+
+// Hook demo: NSStringFromClass (firma CONOCIDA -> PoC seguro).
+//   NSString *NSStringFromClass(Class aClass);
+typedef id (*NSStringFromClass_t)(Class);
+static NSStringFromClass_t orig_NSStringFromClass = NULL;
+
+static id my_NSStringFromClass(Class aClass) {
+    static __thread int reent = 0;            // anti-recursión
+    if(!reent) {
+        reent = 1;
+        const char *n = aClass ?
+            class_getName(aClass) : "(null)";
+        add_log([NSString stringWithFormat:
+            @"  [HOOK] NSStringFromClass(%s)", n]);
+        reent = 0;
+    }
+    return orig_NSStringFromClass(aClass);     // llama al real
+}
+
+// Busca en el GOT de la app el slot cuyo símbolo resuelto == want.
+// Devuelve la dirección del SLOT (void**) o NULL. Sin hardcodear:
+// se recalcula en runtime, así resiste el slide de ASLR.
+static void **find_got_slot(const char *want) {
+    uint32_t target_idx = 0;
+    uint32_t count = _dyld_image_count();
+    for(uint32_t i = 0; i < count; i++) {
+        const char *name = _dyld_get_image_name(i);
+        if(!name) continue;
+        if(strstr(name,"LiveProcess")) continue;
+        if(strstr(name,"usr/lib"))    continue;
+        if(strstr(name,"System"))     continue;
+        if(strstr(name,"framework") &&
+           !strstr(name,"Instagram")) continue;
+        target_idx = i;
+        break;
+    }
+
+    const struct mach_header_64 *mh =
+        (const struct mach_header_64 *)
+        _dyld_get_image_header(target_idx);
+    intptr_t slide =
+        _dyld_get_image_vmaddr_slide(target_idx);
+    if(!mh) return NULL;
+
+    uint8_t *lc = (uint8_t *)mh +
+        sizeof(struct mach_header_64);
+    for(uint32_t i = 0; i < mh->ncmds; i++) {
+        struct load_command *cmd =
+            (struct load_command *)lc;
+        if(cmd->cmd == LC_SEGMENT_64) {
+            struct segment_command_64 *seg =
+                (struct segment_command_64 *)lc;
+            struct section_64 *sec =
+                (struct section_64 *)(lc +
+                sizeof(struct segment_command_64));
+            for(uint32_t j = 0; j < seg->nsects; j++) {
+                BOOL is_got =
+                    strncmp(sec[j].sectname,"__got",5)==0;
+                BOOL is_stubs =
+                    strncmp(sec[j].sectname,
+                            "__la_symbol_ptr",15)==0;
+                if(is_got || is_stubs) {
+                    uint64_t *got = (uint64_t *)(uintptr_t)
+                        (sec[j].addr + slide);
+                    uint64_t n = sec[j].size / 8;
+                    for(uint64_t k = 0; k < n; k++) {
+                        uint64_t v = got[k];
+                        if(!v) continue;
+                        Dl_info info;
+                        if(dladdr((void*)v,&info) &&
+                           info.dli_sname &&
+                           strcmp(info.dli_sname,want)==0)
+                            return (void **)&got[k];
+                    }
+                }
+            }
+        }
+        lc += cmd->cmdsize;
+    }
+    return NULL;
+}
 
 // ── Tracer thread — samplea PCs de threads de la app ──
 static void *tracer_thread(void *arg) {
@@ -423,7 +534,7 @@ static void update_ui(void) {
                 } completion:^(BOOL done){
                     g_panel.hidden = YES;
                 }];
-                [g_fab setTitle:@"⚙"
+                [g_fab setTitle:@"="
                        forState:UIControlStateNormal];
             }
         });
@@ -454,7 +565,7 @@ static void update_ui(void) {
         } completion:^(BOOL done){
             g_panel.hidden = YES;
         }];
-        [g_fab setTitle:@"⚙"
+        [g_fab setTitle:@"="
                forState:UIControlStateNormal];
     }
 }
@@ -464,7 +575,7 @@ static void update_ui(void) {
     UIButton *btn = (UIButton*)
         [g_panel viewWithTag:200];
     NSString *title = g_tracing ?
-        @"⏸ PAUSE" : @"▶ TRACE";
+        @"PAUSE" : @"TRACE";
     UIColor *color = g_tracing ?
         [UIColor colorWithRed:0.7 green:0.1
                         blue:0.1 alpha:1] :
@@ -532,6 +643,32 @@ static void update_ui(void) {
         ^{ read_got(); });
 }
 
++ (void)installHook {
+    add_log(@"── INSTALANDO HOOK ──");
+    dispatch_async(
+        dispatch_get_global_queue(
+            DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        void **slot = find_got_slot("NSStringFromClass");
+        if(!slot) {
+            add_log(@"[HOOK] slot no encontrado");
+            return;
+        }
+        if(orig_NSStringFromClass) {
+            add_log(@"[HOOK] ya estaba instalado");
+            return;
+        }
+        if(got_hook(slot, (void*)my_NSStringFromClass,
+                    (void**)&orig_NSStringFromClass)) {
+            add_log([NSString stringWithFormat:
+                @"[HOOK] NSStringFromClass @ %p OK",
+                (void*)slot]);
+            add_log(@"[HOOK] navega la app para ver hits");
+        } else {
+            add_log(@"[HOOK] fallo (vm_protect)");
+        }
+    });
+}
+
 + (void)fabDragged:(UIPanGestureRecognizer*)pan {
     CGPoint t = [pan translationInView:g_window];
     CGPoint newCenter = CGPointMake(
@@ -586,7 +723,7 @@ static void build_ui(void) {
     g_fab.layer.shadowRadius  = 8;
     g_fab.layer.shadowOffset  =
         CGSizeMake(0, 4);
-    [g_fab setTitle:@"⚙"
+    [g_fab setTitle:@"="
            forState:UIControlStateNormal];
     g_fab.titleLabel.font =
         [UIFont systemFontOfSize:22
@@ -640,14 +777,14 @@ static void build_ui(void) {
     [g_panel addSubview:hdr];
 
     // Botones
-    NSArray *titles  = @[@"▶ TRACE",
-                         @"📋 GOT",
-                         @"🗑 CLEAR",
-                         @"💾 SAVE"];
+    NSArray *titles  = @[@"TRACE",
+                         @"GOT",
+                         @"CLEAR",
+                         @"HOOK"];
     NSArray *sels    = @[@"toggleTrace",
                          @"readGOT",
                          @"clearLog",
-                         @"saveLog"];
+                         @"installHook"];
     NSArray *colors  = @[
         [UIColor colorWithRed:0.1 green:0.5
                         blue:0.1 alpha:1],
@@ -655,11 +792,11 @@ static void build_ui(void) {
                     blue:0.5 alpha:1],
         [UIColor colorWithRed:0.3 green:0.3
                         blue:0.3 alpha:1],
-        [UIColor colorWithRed:0.1 green:0.2
-                        blue:0.6 alpha:1],
+        [UIColor colorWithRed:0.7 green:0.4
+                        blue:0.05 alpha:1],
     ];
-    CGFloat bw = (pw - 28) / 3.0;
-    for(int i = 0; i < 3; i++) {
+    CGFloat bw = (pw - 32) / 4.0;
+    for(int i = 0; i < 4; i++) {
         UIButton *b = [UIButton
             buttonWithType:UIButtonTypeSystem];
         b.frame = CGRectMake(
@@ -748,4 +885,3 @@ static void build_ui(void) {
         build_ui();
     });
 }
-
