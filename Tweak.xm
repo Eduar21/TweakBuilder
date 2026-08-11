@@ -7,6 +7,7 @@
 #include <dlfcn.h>
 #include <stdatomic.h>
 #include <pthread.h>
+#include <cxxabi.h>
 
 #define SAMPLE_MS    150
 #define MAX_LOG      1000
