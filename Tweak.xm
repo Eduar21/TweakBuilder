@@ -1425,4 +1425,3 @@ static void build_ui(void) {
         (int64_t)(3 * NSEC_PER_SEC)),
         dispatch_get_main_queue(), ^{ build_ui(); });
 }
-
