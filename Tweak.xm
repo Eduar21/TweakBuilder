@@ -1273,7 +1273,7 @@ static void build_ui(void) {
     UILabel *hdr = [UILabel new];
     hdr.frame = CGRectMake(12, 10, pw-24, 20);
     hdr.text = [NSString stringWithFormat:
-        @"◈ FLEXING — %@", g_appname ?: @"app"];
+        @"◈ FLEXING v2 — %@", g_appname ?: @"app"];
     hdr.font = [UIFont monospacedSystemFontOfSize:11
                                            weight:UIFontWeightBold];
     hdr.textColor =
@@ -1425,3 +1425,4 @@ static void build_ui(void) {
         (int64_t)(3 * NSEC_PER_SEC)),
         dispatch_get_main_queue(), ^{ build_ui(); });
 }
+
