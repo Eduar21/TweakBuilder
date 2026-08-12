@@ -9,6 +9,7 @@
 #include <stdatomic.h>
 #include <pthread.h>
 #include <mach-o/loader.h>
+#include <stdlib.h>
 
 #define SAMPLE_MS    150
 #define MAX_LOG      1000
@@ -33,7 +34,8 @@ static TermView    *g_termH = nil;
 static TermView    *g_termD = nil;
 static int          g_tab   = 0;      // 0=L 1=H 2=D
 static UIView      *g_ctlL = nil, *g_ctlH = nil, *g_ctlD = nil;
-static UITextField *g_hookField = nil, *g_dumpField = nil;
+static UITextField *g_hkCls = nil, *g_hkSel = nil, *g_hkVal = nil;
+static UITextField *g_dumpField = nil;
 
 // ── Encontrar base de la app target ──
 static void find_base(void) {
@@ -453,6 +455,95 @@ static void unswizzle_instance(Class cls, SEL sel, IMP original) {
 }
 
 // ════════════════════════════════════════════
+//  HOOK ObjC INTERACTIVO: fuerza el retorno de un método
+// ════════════════════════════════════════════
+// Swizzlea el método con un trampolín según el tipo de retorno
+// (del type encoding). El trampolín NO llama al original: devuelve
+// el valor que pediste. Por eso la firma de args no importa (nunca
+// leemos args). cls se guarda como void* para no chocar con ARC.
+typedef struct {
+    void     *cls;          // Class (como void*)
+    SEL       sel;
+    int       kind;         // 0=int 1=double 2=float
+    long long ival;
+    double    dval;
+    IMP       orig;
+} objchook_t;
+
+#define MAX_OBJCHOOK 32
+static objchook_t g_ohooks[MAX_OBJCHOOK];
+static int        g_ohooks_n = 0;
+
+// Encuentra el hook que corresponde a (self, _cmd).
+static objchook_t *ohook_for(id self, SEL _cmd) {
+    Class c = object_getClass(self);
+    for(int i = 0; i < g_ohooks_n; i++) {
+        if(g_ohooks[i].sel != _cmd) continue;
+        if(c == (Class)g_ohooks[i].cls) return &g_ohooks[i];
+        if([self isKindOfClass:(Class)g_ohooks[i].cls])
+            return &g_ohooks[i];
+    }
+    return NULL;
+}
+
+// Trampolines por tipo de retorno (fuerzan, no llaman al original).
+static long long ohook_int(id self, SEL _cmd){
+    objchook_t *h = ohook_for(self,_cmd); return h ? h->ival : 0; }
+static double ohook_dbl(id self, SEL _cmd){
+    objchook_t *h = ohook_for(self,_cmd); return h ? h->dval : 0; }
+static float ohook_flt(id self, SEL _cmd){
+    objchook_t *h = ohook_for(self,_cmd);
+    return h ? (float)h->dval : 0; }
+
+// 1=ok  -1=clase  -2=método  -3=retorno no soportado  -4=lleno
+static int objc_hook_add(const char *cn, const char *sn,
+                         const char *val) {
+    if(g_ohooks_n >= MAX_OBJCHOOK) return -4;
+    Class cls = objc_getClass(cn);
+    if(!cls) return -1;
+    SEL sel = sel_registerName(sn);
+    Method m = class_getInstanceMethod(cls, sel);
+    if(!m) return -2;
+    const char *enc = method_getTypeEncoding(m);
+    if(!enc) return -3;
+    while(*enc && strchr("rnNoORV", *enc)) enc++;  // saltar qualifiers
+    char ret = *enc;
+
+    objchook_t h; memset(&h, 0, sizeof(h));
+    h.cls = (void*)cls; h.sel = sel;
+    IMP tramp = NULL;
+    switch(ret) {
+        case 'B': case 'c': case 'C':
+        case 'i': case 's': case 'l': case 'q':
+        case 'I': case 'S': case 'L': case 'Q':
+            h.kind = 0; h.ival = atoll(val);
+            tramp = (IMP)ohook_int; break;
+        case 'd':
+            h.kind = 1; h.dval = atof(val);
+            tramp = (IMP)ohook_dbl; break;
+        case 'f':
+            h.kind = 2; h.dval = atof(val);
+            tramp = (IMP)ohook_flt; break;
+        default:
+            return -3;   // @/void/struct/ptr: no soportado aún
+    }
+    h.orig = swizzle_instance(cls, sel, tramp);
+    if(!h.orig) return -2;
+    g_ohooks[g_ohooks_n++] = h;
+    return 1;
+}
+
+static void objc_hook_clear_all(void) {
+    for(int i = 0; i < g_ohooks_n; i++) {
+        Method m = class_getInstanceMethod(
+            (Class)g_ohooks[i].cls, g_ohooks[i].sel);
+        if(m && g_ohooks[i].orig)
+            method_setImplementation(m, g_ohooks[i].orig);
+    }
+    g_ohooks_n = 0;
+}
+
+// ════════════════════════════════════════════
 //  ENUMERACIÓN: métodos e ivars de una clase
 // ════════════════════════════════════════════
 // Sirven para elegir objetivos de swizzling. El type encoding
@@ -757,28 +848,52 @@ NSString *cat = categorize(sym);
     LOGL(@"[L] copiado al portapapeles");
 }
 
-// ── Pestaña H (Hook) ──  Run = force-0 por nombre, Stop = quita todos
+// ── Pestaña H (Hook) ──
+// Con selector -> hook ObjC (fuerza retorno). Sin selector -> el
+// campo "clase" se toma como símbolo C y va por GOT force-0.
 + (void)hookRun {
-    NSString *nm = g_hookField.text;
-    [g_hookField resignFirstResponder];
+    NSString *c = g_hkCls.text;
+    NSString *s = g_hkSel.text;
+    NSString *v = g_hkVal.text;
+    [g_panel endEditing:YES];
     dispatch_async(dispatch_get_global_queue(
         DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        if(!nm.length) { LOGH(@"[H] escribí un símbolo"); return; }
-        if(force0_add(nm.UTF8String))
-            LOGH([NSString stringWithFormat:
-                @"[H] %@ -> 0  (activos: %d)", nm, g_force_n]);
-        else
-            LOGH([NSString stringWithFormat:
-                @"[H] %@ no está en el GOT (interno o mal escrito)",
-                nm]);
+        if(!c.length) { LOGH(@"[H] escribí una clase o símbolo"); return; }
+        if(s.length) {
+            // Hook ObjC interactivo
+            const char *val = v.length ? v.UTF8String : "0";
+            int rc = objc_hook_add(c.UTF8String, s.UTF8String, val);
+            switch(rc) {
+                case 1: LOGH([NSString stringWithFormat:
+                    @"[H] -[%@ %@] -> %@  ON (activos: %d)",
+                    c, s, v.length?v:@"0", g_ohooks_n]); break;
+                case -1: LOGH([NSString stringWithFormat:
+                    @"[H] clase no encontrada: %@", c]); break;
+                case -2: LOGH([NSString stringWithFormat:
+                    @"[H] método no encontrado: -[%@ %@]", c, s]); break;
+                case -3: LOGH(@"[H] retorno no soportado "
+                    @"(objeto/void/struct — probá un BOOL/int/double)"); break;
+                case -4: LOGH(@"[H] tabla llena"); break;
+                default: LOGH(@"[H] fallo"); break;
+            }
+        } else {
+            // Sin selector: GOT force-0 sobre símbolo C
+            if(force0_add(c.UTF8String))
+                LOGH([NSString stringWithFormat:
+                    @"[H] (GOT) %@ -> 0  (activos: %d)", c, g_force_n]);
+            else
+                LOGH([NSString stringWithFormat:
+                    @"[H] %@ no está en el GOT", c]);
+        }
     });
 }
 
 + (void)hookStop {
     dispatch_async(dispatch_get_global_queue(
         DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        objc_hook_clear_all();
         force0_clear_all();
-        LOGH(@"[H] hooks quitados");
+        LOGH(@"[H] todos los hooks quitados");
     });
 }
 
@@ -1008,22 +1123,28 @@ static void build_ui(void) {
     }
     [g_panel addSubview:g_ctlL];
 
-    // ── Controles H: campo + RUN / STOP / CLEAR ──
+    // ── Controles H: clase / selector / valor + RUN/STOP/CLEAR ──
     g_ctlH = [[UIView alloc] initWithFrame:
-        CGRectMake(0, ctl_y, pw, 72)];
-    g_hookField = mkfield(@"símbolo C (ej: METADeviceIsJailbroken)",
+        CGRectMake(0, ctl_y, pw, 150)];
+    g_hkCls = mkfield(@"Clase (IGMedia)  ·  o símbolo C p/ GOT",
         CGRectMake(10, 0, pw-20, 32));
-    [g_ctlH addSubview:g_hookField];
+    g_hkSel = mkfield(@"selector (isChildOfAdItem)  ·  vacío = GOT",
+        CGRectMake(10, 38, pw-20, 32));
+    g_hkVal = mkfield(@"retorno forzado (0 · 1 · 3.14)",
+        CGRectMake(10, 76, pw-20, 32));
+    [g_ctlH addSubview:g_hkCls];
+    [g_ctlH addSubview:g_hkSel];
+    [g_ctlH addSubview:g_hkVal];
     [g_ctlH addSubview:mkbtn(@"RUN", @selector(hookRun),
-        CGRectMake(10, 38, b3, 30), cOrange)];
+        CGRectMake(10, 116, b3, 30), cOrange)];
     [g_ctlH addSubview:mkbtn(@"STOP", @selector(hookStop),
-        CGRectMake(10+(b3+4), 38, b3, 30), cRed)];
+        CGRectMake(10+(b3+4), 116, b3, 30), cRed)];
     [g_ctlH addSubview:mkbtn(@"CLEAR", @selector(clearH),
-        CGRectMake(10+2*(b3+4), 38, b3, 30), cGray)];
+        CGRectMake(10+2*(b3+4), 116, b3, 30), cGray)];
     g_ctlH.hidden = YES;
     [g_panel addSubview:g_ctlH];
 
-    // ── Controles D: campo + DUMP / IVARS / GOT (+CLEAR) ──
+    // ── Controles D: campo + DUMP / IVARS / GOT ──
     g_ctlD = [[UIView alloc] initWithFrame:
         CGRectMake(0, ctl_y, pw, 72)];
     g_dumpField = mkfield(@"clase (IGMedia) o filtro GOT (Jailbroken)",
@@ -1038,11 +1159,13 @@ static void build_ui(void) {
     g_ctlD.hidden = YES;
     [g_panel addSubview:g_ctlD];
 
-    // ── Tres terminales (misma zona, se muestra la activa) ──
-    CGRect tf = CGRectMake(6, term_y, pw-12, term_h);
-    g_termL = [[TermView alloc] initWithFrame:tf];
-    g_termH = [[TermView alloc] initWithFrame:tf];
-    g_termD = [[TermView alloc] initWithFrame:tf];
+    // ── Terminales. H arranca más abajo (sus controles son altos) ──
+    CGRect tfLD = CGRectMake(6, term_y, pw-12, term_h);
+    CGFloat hterm_y = ctl_y + 156;
+    CGRect tfH = CGRectMake(6, hterm_y, pw-12, ph - hterm_y - 8);
+    g_termL = [[TermView alloc] initWithFrame:tfLD];
+    g_termH = [[TermView alloc] initWithFrame:tfH];
+    g_termD = [[TermView alloc] initWithFrame:tfLD];
     g_termH.hidden = YES;
     g_termD.hidden = YES;
     [g_panel addSubview:g_termL];
