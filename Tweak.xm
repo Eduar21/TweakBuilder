@@ -36,6 +36,9 @@ static int          g_tab   = 0;      // 0=L 1=H 2=D
 static UIView      *g_ctlL = nil, *g_ctlH = nil, *g_ctlD = nil;
 static UITextField *g_hkCls = nil, *g_hkSel = nil, *g_hkVal = nil;
 static UITextField *g_dumpField = nil;
+static UISegmentedControl *g_seg = nil;
+static BOOL         g_pick_mode = NO;      // inspector por toque
+static UIView      *g_pickCatcher = nil;
 
 // ── Encontrar base de la app target ──
 static void find_base(void) {
@@ -707,6 +710,49 @@ static void dump_class_ivars(const char *clsname) {
     LOGD(@"═══════════════════");
 }
 
+// ── Inspector por toque: describe una vista tocada ──
+static void inspect_view(UIView *v) {
+    LOGD(@"═══════ PICK ═══════");
+    LOGD([NSString stringWithFormat:@"TOCASTE: %s",
+        object_getClassName(v)]);
+
+    // Cadena de superclases (para saber qué podés hookear arriba)
+    NSMutableString *chain = [NSMutableString string];
+    for(Class c = object_getClass(v); c; c = class_getSuperclass(c)) {
+        [chain appendFormat:@"%s", class_getName(c)];
+        if(class_getSuperclass(c)) [chain appendString:@" -> "];
+    }
+    LOGD([NSString stringWithFormat:@"  clase: %@", chain]);
+
+    // Superviews (hasta 4 niveles)
+    NSMutableString *sup = [NSMutableString string];
+    UIView *p = v.superview; int n = 0;
+    while(p && n < 4) {
+        [sup appendFormat:@"%s", object_getClassName(p)];
+        p = p.superview; n++;
+        if(p && n < 4) [sup appendString:@" > "];
+    }
+    if(sup.length)
+        LOGD([NSString stringWithFormat:@"  super: %@", sup]);
+
+    // Métodos que retornan BOOL (candidatos directos a hookear)
+    LOGD(@"  BOOL directos:");
+    unsigned int mc = 0;
+    Method *ml = class_copyMethodList(object_getClass(v), &mc);
+    int shown = 0;
+    for(unsigned int i = 0; i < mc; i++) {
+        const char *enc = method_getTypeEncoding(ml[i]);
+        if(enc && enc[0] == 'B') {
+            LOGD([NSString stringWithFormat:@"    -%s",
+                sel_getName(method_getName(ml[i]))]);
+            shown++;
+        }
+    }
+    if(ml) free(ml);
+    if(!shown) LOGD(@"    (ninguno directo; mirá isEnabled/isHidden de UIView/UIControl)");
+    LOGD(@"════════════════════");
+}
+
 // ── Tracer thread — samplea PCs de threads de la app ──
 static void *tracer_thread(void *arg) {
     g_self_thread = pthread_self();
@@ -818,6 +864,16 @@ NSString *cat = categorize(sym);
         CGPoint p = [self convertPoint:point toView:g_fab];
         if([g_fab pointInside:p withEvent:event])
             return g_fab;
+    }
+    // Modo PICK: el FAB cancela; el panel sigue usable; todo lo
+    // demás va al catcher para inspeccionar la vista de IG debajo.
+    if(g_pick_mode && g_pickCatcher && !g_pickCatcher.hidden) {
+        if(g_panel && g_expanded && !g_panel.hidden) {
+            CGPoint p = [self convertPoint:point toView:g_panel];
+            if([g_panel pointInside:p withEvent:event])
+                return [g_panel hitTest:p withEvent:event] ?: g_panel;
+        }
+        return g_pickCatcher;
     }
     // Panel abierto
     if(g_panel && g_expanded && !g_panel.hidden) {
@@ -1044,6 +1100,36 @@ NSString *cat = categorize(sym);
 
 + (void)clearD { [g_termD clearAll]; }
 
+// ── Inspector por toque (PICK) ──
++ (void)startPick {
+    g_pick_mode = YES;
+    if(g_pickCatcher) g_pickCatcher.hidden = NO;
+    LOGD(@"[PICK] tocá algo en IG para inspeccionarlo "
+         @"(el FAB cancela)");
+}
++ (void)endPick {
+    g_pick_mode = NO;
+    if(g_pickCatcher) g_pickCatcher.hidden = YES;
+}
++ (void)pickToggle {
+    if(g_pick_mode) { [self endPick]; LOGD(@"[PICK] cancelado"); }
+    else [self startPick];
+}
++ (void)pickTapped:(UITapGestureRecognizer*)g {
+    CGPoint pt = [g locationInView:g_window];
+    // Ventana de la app (no la nuestra)
+    UIWindow *appwin = nil;
+    for(UIWindow *w in g_window.windowScene.windows)
+        if(w != g_window) { appwin = w; break; }
+    UIView *hit = appwin ? [appwin hitTest:pt withEvent:nil] : nil;
+    [self endPick];
+    // Mostrar resultados en la pestaña D
+    g_seg.selectedSegmentIndex = 2;
+    [self switchTab:g_seg];
+    if(!hit) { LOGD(@"[PICK] no encontré vista ahí"); return; }
+    inspect_view(hit);
+}
+
 // ── FAB arrastrable ──
 + (void)fabDragged:(UIPanGestureRecognizer*)pan {
     CGPoint t = [pan translationInView:g_window];
@@ -1171,7 +1257,7 @@ static void build_ui(void) {
 
     // ── Panel ──
     CGFloat pw = W - 24;
-    CGFloat ph = H * 0.72;
+    CGFloat ph = H * 0.80;
     g_panel = [[UIView alloc] initWithFrame:CGRectMake(
         12, H - ph - 20, pw, ph)];
     g_panel.backgroundColor =
@@ -1203,6 +1289,7 @@ static void build_ui(void) {
             action:@selector(switchTab:)
   forControlEvents:UIControlEventValueChanged];
     [g_panel addSubview:seg];
+    g_seg = seg;
 
     // Geometría común
     CGFloat ctl_y = 74;                 // fila de controles
@@ -1265,9 +1352,9 @@ static void build_ui(void) {
     g_ctlH.hidden = YES;
     [g_panel addSubview:g_ctlH];
 
-    // ── Controles D: campo + DUMP / IVARS / GOT ──
+    // ── Controles D: campo + DUMP / IVARS / GOT + PICK ──
     g_ctlD = [[UIView alloc] initWithFrame:
-        CGRectMake(0, ctl_y, pw, 72)];
+        CGRectMake(0, ctl_y, pw, 108)];
     g_dumpField = mkfield(@"clase (IGMedia) o filtro GOT (Jailbroken)",
         CGRectMake(10, 0, pw-20, 32));
     [g_ctlD addSubview:g_dumpField];
@@ -1277,6 +1364,10 @@ static void build_ui(void) {
         CGRectMake(10+(b3+4), 38, b3, 30), cOlive)];
     [g_ctlD addSubview:mkbtn(@"GOT", @selector(dGot),
         CGRectMake(10+2*(b3+4), 38, b3, 30), cPurple)];
+    [g_ctlD addSubview:mkbtn(@"PICK  (tocá una vista)",
+        @selector(pickToggle),
+        CGRectMake(10, 72, pw-20, 30),
+        [UIColor colorWithRed:0.1 green:0.55 blue:0.3 alpha:1])];
     g_ctlD.hidden = YES;
     [g_panel addSubview:g_ctlD];
 
@@ -1292,6 +1383,17 @@ static void build_ui(void) {
     [g_panel addSubview:g_termL];
     [g_panel addSubview:g_termH];
     [g_panel addSubview:g_termD];
+
+    // Catcher del inspector por toque (transparente, oculto)
+    g_pickCatcher = [[UIView alloc]
+        initWithFrame:g_window.bounds];
+    g_pickCatcher.backgroundColor = UIColor.clearColor;
+    g_pickCatcher.hidden = YES;
+    [g_pickCatcher addGestureRecognizer:
+        [[UITapGestureRecognizer alloc]
+            initWithTarget:DisasmController.class
+                    action:@selector(pickTapped:)]];
+    [g_window addSubview:g_pickCatcher];
 
     [g_window addSubview:g_panel];
     [g_window makeKeyAndVisible];
