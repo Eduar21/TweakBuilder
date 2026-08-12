@@ -15,19 +15,25 @@
 #define LOG_MAX_CHAR (512*1024)
 
 // ── Estado global ──
-static UIWindow        *g_window   = nil;
-static UITextView      *g_textview = nil;
-static UIButton        *g_fab      = nil;
-static UIView          *g_panel    = nil;
-static BOOL             g_expanded = NO;
-static BOOL             g_tracing  = NO;
-static atomic_bool      g_running  = false;
-static pthread_t        g_thread;
-static NSMutableString *g_log      = nil;
-static NSLock          *g_lock     = nil;
-static uint64_t         g_base     = 0;
-static NSString        *g_appname  = nil;
-static pthread_t        g_self_thread;
+static UIWindow    *g_window   = nil;
+static UIButton    *g_fab      = nil;
+static UIView      *g_panel    = nil;
+static BOOL         g_expanded = NO;
+static BOOL         g_tracing  = NO;
+static atomic_bool  g_running  = false;
+static pthread_t    g_thread;
+static uint64_t     g_base     = 0;
+static NSString    *g_appname  = nil;
+static pthread_t    g_self_thread;
+
+// Tres terminales independientes (L=Log/Inspector, H=Hook, D=Dump)
+@class TermView;
+static TermView    *g_termL = nil;
+static TermView    *g_termH = nil;
+static TermView    *g_termD = nil;
+static int          g_tab   = 0;      // 0=L 1=H 2=D
+static UIView      *g_ctlL = nil, *g_ctlH = nil, *g_ctlD = nil;
+static UITextField *g_hookField = nil, *g_dumpField = nil;
 
 // ── Encontrar base de la app target ──
 static void find_base(void) {
@@ -46,15 +52,74 @@ static void find_base(void) {
     }
 }
 
-// ── Log ──
-static void add_log(NSString *line) {
-    [g_lock lock];
-    if(g_log.length > LOG_MAX_CHAR)
-        [g_log deleteCharactersInRange:
-            NSMakeRange(0, g_log.length/2)];
-    [g_log appendFormat:@"%@\n", line];
-    [g_lock unlock];
+// ── TermView: terminal con auto-scroll inteligente ──
+// Cada pestaña tiene la suya, con buffer propio. append: baja
+// solo si ya estás pegado al fondo (arregla el "me tira abajo").
+@interface TermView : UIView
+@property(nonatomic,strong) UITextView *tv;
+- (void)append:(NSString*)s;
+- (void)clearAll;
+- (NSString*)text;
+@end
+
+@implementation TermView
+- (instancetype)initWithFrame:(CGRect)f {
+    if((self = [super initWithFrame:f])) {
+        _tv = [[UITextView alloc]
+            initWithFrame:self.bounds];
+        _tv.autoresizingMask =
+            UIViewAutoresizingFlexibleWidth |
+            UIViewAutoresizingFlexibleHeight;
+        _tv.backgroundColor =
+            [UIColor colorWithWhite:0.02 alpha:1];
+        _tv.textColor =
+            [UIColor colorWithRed:0.3 green:1
+                             blue:0.45 alpha:1];
+        _tv.font = [UIFont
+            monospacedSystemFontOfSize:10
+                                weight:UIFontWeightRegular];
+        _tv.editable = NO;
+        _tv.layer.cornerRadius = 8;
+        [self addSubview:_tv];
+    }
+    return self;
 }
+- (void)append:(NSString*)s {
+    NSString *line = [s stringByAppendingString:@"\n"];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UITextView *tv = self.tv;
+        CGFloat dist = tv.contentSize.height -
+            tv.contentOffset.y - tv.bounds.size.height;
+        BOOL atBottom = dist < 44;   // scroll inteligente
+        NSDictionary *attrs = @{
+            NSFontAttributeName: tv.font,
+            NSForegroundColorAttributeName: tv.textColor
+        };
+        [tv.textStorage appendAttributedString:
+            [[NSAttributedString alloc]
+                initWithString:line attributes:attrs]];
+        if(tv.textStorage.length > 200000)
+            [tv.textStorage deleteCharactersInRange:
+                NSMakeRange(0, 80000)];
+        if(atBottom)
+            [tv scrollRangeToVisible:
+                NSMakeRange(tv.textStorage.length, 0)];
+    });
+}
+- (void)clearAll {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        self.tv.text = @"";
+    });
+}
+- (NSString*)text { return self.tv.text ?: @""; }
+@end
+
+// ── Log: enrutado a cada terminal ──
+static void LOGL(NSString *s){ if(g_termL) [g_termL append:s]; }
+static void LOGH(NSString *s){ if(g_termH) [g_termH append:s]; }
+static void LOGD(NSString *s){ if(g_termD) [g_termD append:s]; }
+// add_log = terminal L (tracer + general).
+static void add_log(NSString *line){ LOGL(line); }
 
 // ── Demangle C++ symbols ──
 static NSString *demangle(const char *sym) {
@@ -242,9 +307,9 @@ static void read_got_filtered(const char *filter) {
         _dyld_get_image_header(target_idx);
     intptr_t slide =
         _dyld_get_image_vmaddr_slide(target_idx);
-    if(!mh) { add_log(@"[GOT] no encontré header"); return; }
+    if(!mh) { LOGD(@"[GOT] no encontré header"); return; }
 
-    add_log([NSString stringWithFormat:@"═══ GOT: %s ═══",
+    LOGD([NSString stringWithFormat:@"═══ GOT: %s ═══",
         all ? filter : "(primeras 40)"]);
 
     const int CAP = all ? 200 : 40;
@@ -279,7 +344,7 @@ static void read_got_filtered(const char *filter) {
                     if(all && !strcasestr(info.dli_sname, filter))
                         continue;
                     matched++;
-                    add_log([NSString stringWithFormat:
+                    LOGD([NSString stringWithFormat:
                         @"  0x%llx -> %@",
                         (uint64_t)&got[k],
                         demangle(info.dli_sname)]);
@@ -289,10 +354,10 @@ static void read_got_filtered(const char *filter) {
         }
         lc += cmd->cmdsize;
     }
-    add_log([NSString stringWithFormat:
+    LOGD([NSString stringWithFormat:
         @"── match: %d (mostrados %d / cap %d) ──",
         matched, shown, CAP]);
-    add_log(@"═══════════════════");
+    LOGD(@"═══════════════════");
 }
 
 // Busca en el GOT de la app el slot cuyo símbolo resuelto == want.
@@ -365,6 +430,8 @@ static void **find_got_slot(const char *want) {
 // Genérico: intercambia la IMP de un método de instancia.
 // Devuelve la IMP original (para llamarla desde tu trampolín).
 // Si el método es HEREDADO, lo agrega a cls para no pisar al padre.
+// (base del futuro hook interactivo ObjC; unused por ahora)
+__attribute__((unused))
 static IMP swizzle_instance(Class cls, SEL sel, IMP replacement) {
     if(!cls || !sel || !replacement) return NULL;
     Method m = class_getInstanceMethod(cls, sel);
@@ -378,28 +445,11 @@ static IMP swizzle_instance(Class cls, SEL sel, IMP replacement) {
 }
 
 // Restaura la IMP original de un método de instancia.
+__attribute__((unused))
 static void unswizzle_instance(Class cls, SEL sel, IMP original) {
     if(!cls || !sel || !original) return;
     Method m = class_getInstanceMethod(cls, sel);
     if(m) method_setImplementation(m, original);
-}
-
-// Swizzle demo: -[UIViewController viewDidAppear:] (firma conocida).
-//   - (void)viewDidAppear:(BOOL)animated;
-typedef void (*vda_t)(id, SEL, BOOL);
-static vda_t orig_vda        = NULL;
-static BOOL  g_demo_swizzled = NO;
-
-static void my_viewDidAppear(id self, SEL _cmd, BOOL animated) {
-    static __thread int reent = 0;
-    if(!reent) {
-        reent = 1;
-        add_log([NSString stringWithFormat:
-            @"  [SWZ] viewDidAppear: %s",
-            object_getClassName(self)]);
-        reent = 0;
-    }
-    if(orig_vda) orig_vda(self, _cmd, animated); // llama al real
 }
 
 // ════════════════════════════════════════════
@@ -413,25 +463,25 @@ static void my_viewDidAppear(id self, SEL _cmd, BOOL animated) {
 
 static void dump_class_methods(const char *clsname) {
     if(!clsname || !clsname[0]) {
-        add_log(@"[DUMP] nombre vacío"); return;
+        LOGD(@"[DUMP] nombre vacío"); return;
     }
     Class cls = objc_getClass(clsname);
     if(!cls) {
-        add_log([NSString stringWithFormat:
+        LOGD([NSString stringWithFormat:
             @"[DUMP] no encontrada: %s "
             @"(¿Swift con módulo? usa mangled)", clsname]);
         return;
     }
-    add_log([NSString stringWithFormat:
+    LOGD([NSString stringWithFormat:
         @"═══ MÉTODOS %s ═══", clsname]);
 
     unsigned int n = 0;
     Method *ml = class_copyMethodList(cls, &n);
-    add_log([NSString stringWithFormat:
+    LOGD([NSString stringWithFormat:
         @"── instancia: %u ──", n]);
     for(unsigned int i = 0; i < n; i++) {
         const char *enc = method_getTypeEncoding(ml[i]);
-        add_log([NSString stringWithFormat:@"  -%s  %s",
+        LOGD([NSString stringWithFormat:@"  -%s  %s",
             sel_getName(method_getName(ml[i])), enc ?: ""]);
     }
     if(ml) free(ml);
@@ -439,39 +489,39 @@ static void dump_class_methods(const char *clsname) {
     Class meta = object_getClass((id)cls);
     n = 0;
     ml = class_copyMethodList(meta, &n);
-    add_log([NSString stringWithFormat:
+    LOGD([NSString stringWithFormat:
         @"── clase: %u ──", n]);
     for(unsigned int i = 0; i < n; i++) {
         const char *enc = method_getTypeEncoding(ml[i]);
-        add_log([NSString stringWithFormat:@"  +%s  %s",
+        LOGD([NSString stringWithFormat:@"  +%s  %s",
             sel_getName(method_getName(ml[i])), enc ?: ""]);
     }
     if(ml) free(ml);
-    add_log(@"═══════════════════");
+    LOGD(@"═══════════════════");
 }
 
 static void dump_class_ivars(const char *clsname) {
     if(!clsname || !clsname[0]) {
-        add_log(@"[IVARS] nombre vacío"); return;
+        LOGD(@"[IVARS] nombre vacío"); return;
     }
     Class cls = objc_getClass(clsname);
     if(!cls) {
-        add_log([NSString stringWithFormat:
+        LOGD([NSString stringWithFormat:
             @"[IVARS] no encontrada: %s", clsname]);
         return;
     }
     unsigned int n = 0;
     Ivar *iv = class_copyIvarList(cls, &n);
-    add_log([NSString stringWithFormat:
+    LOGD([NSString stringWithFormat:
         @"═══ IVARS %s (%u) ═══", clsname, n]);
     for(unsigned int i = 0; i < n; i++) {
         const char *tp = ivar_getTypeEncoding(iv[i]);
-        add_log([NSString stringWithFormat:@"  +0x%lx %s  %s",
+        LOGD([NSString stringWithFormat:@"  +0x%lx %s  %s",
             (long)ivar_getOffset(iv[i]),
             ivar_getName(iv[i]) ?: "?", tp ?: ""]);
     }
     if(iv) free(iv);
-    add_log(@"═══════════════════");
+    LOGD(@"═══════════════════");
 }
 
 // ── Tracer thread — samplea PCs de threads de la app ──
@@ -567,69 +617,41 @@ NSString *cat = categorize(sym);
     return NULL;
 }
 
-// ── Actualizar UI ──
-static void update_ui(void) {
-    if(!g_expanded || !g_textview) return;
-    [g_lock lock];
-    NSString *text = [g_log copy];
-    [g_lock unlock];
-
-    NSArray *lines =
-        [text componentsSeparatedByString:@"\n"];
-    NSInteger start = lines.count > MAX_LOG ?
-        lines.count - MAX_LOG : 0;
-    NSString *display =
-        [[lines subarrayWithRange:
-            NSMakeRange(start, lines.count-start)]
-         componentsJoinedByString:@"\n"];
-
-    dispatch_async(dispatch_get_main_queue(), ^{
-        g_textview.text = display;
-        if(display.length > 0)
-            [g_textview scrollRangeToVisible:
-                NSMakeRange(display.length-1, 1)];
-    });
-}
-
 // ── Passthrough Window ──
+// Nivel bajado a Normal+1: por encima de la app pero por DEBAJO del
+// menú de copiar/pegar de iOS (arregla la barra que quedaba detrás).
 @interface PassthroughWindow : UIWindow
 @end
 
 @implementation PassthroughWindow
 - (UIView *)hitTest:(CGPoint)point
           withEvent:(UIEvent *)event {
-    // 0. Si hay un VC modal presentado (UIAlertController, sheet),
-    //    la ventana debe comportarse normal: si no, el passthrough
-    //    se traga los toques y los botones del alert no responden.
+    // Si hay un VC modal presentado (alert de Guardado), normal.
     if(self.rootViewController.presentedViewController) {
         return [super hitTest:point withEvent:event];
     }
     // FAB
     if(g_fab && !g_fab.hidden) {
-        CGPoint p = [self convertPoint:point
-                                toView:g_fab];
+        CGPoint p = [self convertPoint:point toView:g_fab];
         if([g_fab pointInside:p withEvent:event])
             return g_fab;
     }
     // Panel abierto
     if(g_panel && g_expanded && !g_panel.hidden) {
-        CGPoint p = [self convertPoint:point
-                                toView:g_panel];
+        CGPoint p = [self convertPoint:point toView:g_panel];
         if([g_panel pointInside:p withEvent:event])
-            return [g_panel hitTest:p
-                          withEvent:event] ?: g_panel;
-        // Toque FUERA del panel — cerrar
+            return [g_panel hitTest:p withEvent:event] ?: g_panel;
+        // Toque fuera del panel: cerrar (salvo si el teclado está)
         dispatch_async(dispatch_get_main_queue(), ^{
             if(g_expanded) {
+                [g_panel endEditing:YES];
                 g_expanded = NO;
-                [UIView animateWithDuration:0.2
-                                 animations:^{
+                [UIView animateWithDuration:0.2 animations:^{
                     g_panel.alpha = 0;
                 } completion:^(BOOL done){
                     g_panel.hidden = YES;
                 }];
-                [g_fab setTitle:@"="
-                       forState:UIControlStateNormal];
+                [g_fab setTitle:@"=" forState:UIControlStateNormal];
             }
         });
     }
@@ -650,276 +672,207 @@ static void update_ui(void) {
         [UIView animateWithDuration:0.2 animations:^{
             g_panel.alpha = 1;
         }];
-        [g_fab setTitle:@"✕"
-               forState:UIControlStateNormal];
+        [g_fab setTitle:@"✕" forState:UIControlStateNormal];
     } else {
-        [UIView animateWithDuration:0.2
-                         animations:^{
+        [g_panel endEditing:YES];
+        [UIView animateWithDuration:0.2 animations:^{
             g_panel.alpha = 0;
         } completion:^(BOOL done){
             g_panel.hidden = YES;
         }];
-        [g_fab setTitle:@"="
-               forState:UIControlStateNormal];
+        [g_fab setTitle:@"=" forState:UIControlStateNormal];
     }
 }
 
+// ── Selector de pestaña L / H / D ──
++ (void)switchTab:(UISegmentedControl*)seg {
+    g_tab = (int)seg.selectedSegmentIndex;
+    g_ctlL.hidden  = (g_tab != 0);
+    g_ctlH.hidden  = (g_tab != 1);
+    g_ctlD.hidden  = (g_tab != 2);
+    g_termL.hidden = (g_tab != 0);
+    g_termH.hidden = (g_tab != 1);
+    g_termD.hidden = (g_tab != 2);
+    if(g_tab != 1 && g_tab != 2) [g_panel endEditing:YES];
+}
+
+// ── Pestaña L (Log / Inspector) ──
 + (void)toggleTrace {
     g_tracing = !g_tracing;
-    UIButton *btn = (UIButton*)
-        [g_panel viewWithTag:200];
-    NSString *title = g_tracing ?
-        @"PAUSE" : @"TRACE";
-    UIColor *color = g_tracing ?
-        [UIColor colorWithRed:0.7 green:0.1
-                        blue:0.1 alpha:1] :
-        [UIColor colorWithRed:0.1 green:0.5
-                        blue:0.1 alpha:1];
-    [btn setTitle:title
+    UIButton *btn = (UIButton*)[g_panel viewWithTag:200];
+    [btn setTitle:(g_tracing ? @"PAUSE" : @"TRACE")
          forState:UIControlStateNormal];
-    btn.backgroundColor = color;
-    if(!g_tracing) {
-        add_log(@"── PAUSADO ──");
-    } else {
-        add_log(@"── TRACE INICIADO ──");
-    }
+    btn.backgroundColor = g_tracing ?
+        [UIColor colorWithRed:0.7 green:0.1 blue:0.1 alpha:1] :
+        [UIColor colorWithRed:0.1 green:0.5 blue:0.1 alpha:1];
+    LOGL(g_tracing ? @"── TRACE INICIADO ──" : @"── PAUSADO ──");
 }
 
-+ (void)clearLog {
-    [g_lock lock];
-    [g_log setString:@""];
-    [g_lock unlock];
-    dispatch_async(dispatch_get_main_queue(), ^{
-        g_textview.text = @"";
-    });
-}
++ (void)clearL { [g_termL clearAll]; }
 
-+ (void)saveLog {
-    [g_lock lock];
-    NSString *text = [g_log copy];
-    [g_lock unlock];
-    NSString *docs =
-        NSSearchPathForDirectoriesInDomains(
-            NSDocumentDirectory,
-            NSUserDomainMask, YES).firstObject;
-    NSString *path =
-        [docs stringByAppendingPathComponent:
-            @"live_trace.txt"];
++ (void)saveL {
+    NSString *text = [g_termL text];
+    NSString *docs = NSSearchPathForDirectoriesInDomains(
+        NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+    NSString *path = [docs stringByAppendingPathComponent:
+        @"live_trace.txt"];
     [text writeToFile:path atomically:YES
-             encoding:NSUTF8StringEncoding
-                error:nil];
-    dispatch_async(dispatch_get_main_queue(), ^{
-        UIAlertController *a =
-            [UIAlertController
-                alertControllerWithTitle:@"Guardado"
-                                 message:path
-                          preferredStyle:
-                            UIAlertControllerStyleAlert];
-        [a addAction:[UIAlertAction
-            actionWithTitle:@"OK"
-                      style:UIAlertActionStyleDefault
-                    handler:nil]];
-        UIViewController *root =
-            g_window.rootViewController;
-        while(root.presentedViewController)
-            root = root.presentedViewController;
-        [root presentViewController:a
-                           animated:YES
-                         completion:nil];
-    });
-}
-
-+ (void)readGOT {
-    [self prompt:@"Buscar en GOT"
-     placeholder:@"Jailbroken  (vacío = primeras 40)"
-          action:^(NSString *f){
-        dispatch_async(dispatch_get_global_queue(
-            DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-            read_got_filtered(f.length ? f.UTF8String : NULL);
-        });
-    }];
-}
-
-+ (void)setButtonTag:(NSInteger)tag title:(NSString*)t {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        UIButton *b = (UIButton*)[g_panel viewWithTag:tag];
-        [b setTitle:t forState:UIControlStateNormal];
-    });
-}
-
-+ (void)installHook {
+             encoding:NSUTF8StringEncoding error:nil];
     dispatch_async(dispatch_get_main_queue(), ^{
         UIAlertController *a = [UIAlertController
-            alertControllerWithTitle:@"Force-0 (GOT)"
-                             message:@"Símbolo C a forzar a 0/NO"
+            alertControllerWithTitle:@"Guardado" message:path
                       preferredStyle:UIAlertControllerStyleAlert];
-        [a addTextFieldWithConfigurationHandler:
-            ^(UITextField *tf){
-            tf.placeholder = @"METADeviceAppearsJailbroken";
-            tf.autocorrectionType = UITextAutocorrectionTypeNo;
-            tf.autocapitalizationType =
-                UITextAutocapitalizationTypeNone;
-        }];
-        [a addAction:[UIAlertAction actionWithTitle:@"Forzar 0"
-            style:UIAlertActionStyleDefault
-            handler:^(UIAlertAction *x){
-            NSString *nm = a.textFields.firstObject.text;
-            dispatch_async(dispatch_get_global_queue(
-                DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-                if(!nm.length) { add_log(@"[FORCE] vacío"); return; }
-                if(force0_add(nm.UTF8String)) {
-                    add_log([NSString stringWithFormat:
-                        @"[FORCE] %@ -> 0 (activos: %d)",
-                        nm, g_force_n]);
-                } else {
-                    add_log([NSString stringWithFormat:
-                        @"[FORCE] %@ no está en el GOT "
-                        @"(interno o mal escrito)", nm]);
-                }
-                [self setButtonTag:201 title:(g_force_n
-                    ? [NSString stringWithFormat:@"HOOK·%d",
-                        g_force_n] : @"HOOK")];
-            });
-        }]];
-        [a addAction:[UIAlertAction actionWithTitle:@"Quitar todos"
-            style:UIAlertActionStyleDestructive
-            handler:^(UIAlertAction *x){
-            dispatch_async(dispatch_get_global_queue(
-                DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-                force0_clear_all();
-                add_log(@"[FORCE] todos quitados");
-                [self setButtonTag:201 title:@"HOOK"];
-            });
-        }]];
-        [a addAction:[UIAlertAction actionWithTitle:@"Cancelar"
-            style:UIAlertActionStyleCancel handler:nil]];
-        UIViewController *root = g_window.rootViewController;
-        while(root.presentedViewController)
-            root = root.presentedViewController;
-        [root presentViewController:a animated:YES
-                         completion:nil];
-    });
-}
-
-+ (void)installSwizzle {
-    Class cls = objc_getClass("UIViewController");
-    SEL   sel = @selector(viewDidAppear:);
-    if(!g_demo_swizzled) {
-        IMP old = swizzle_instance(cls, sel,
-                                   (IMP)my_viewDidAppear);
-        if(old) {
-            orig_vda = (vda_t)old;
-            g_demo_swizzled = YES;
-            add_log(@"[SWZ] -[UIViewController "
-                    @"viewDidAppear:] ON");
-            [self setButtonTag:202 title:@"UNSWZ"];
-        } else {
-            add_log(@"[SWZ] método no encontrado");
-        }
-    } else {
-        unswizzle_instance(cls, sel, (IMP)orig_vda);
-        g_demo_swizzled = NO;
-        add_log(@"[SWZ] viewDidAppear: OFF");
-        [self setButtonTag:202 title:@"SWZ"];
-    }
-}
-
-+ (void)prompt:(NSString*)title
-   placeholder:(NSString*)ph
-        action:(void(^)(NSString*))action {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        UIAlertController *a = [UIAlertController
-            alertControllerWithTitle:title
-                             message:nil
-                      preferredStyle:UIAlertControllerStyleAlert];
-        [a addTextFieldWithConfigurationHandler:
-            ^(UITextField *tf){
-            tf.placeholder = ph;
-            tf.autocorrectionType = UITextAutocorrectionTypeNo;
-            tf.autocapitalizationType =
-                UITextAutocapitalizationTypeNone;
-        }];
         [a addAction:[UIAlertAction actionWithTitle:@"OK"
-            style:UIAlertActionStyleDefault
-            handler:^(UIAlertAction *x){
-            action(a.textFields.firstObject.text);
-        }]];
-        [a addAction:[UIAlertAction actionWithTitle:@"Cancelar"
-            style:UIAlertActionStyleCancel handler:nil]];
+            style:UIAlertActionStyleDefault handler:nil]];
         UIViewController *root = g_window.rootViewController;
         while(root.presentedViewController)
             root = root.presentedViewController;
-        [root presentViewController:a animated:YES
-                         completion:nil];
+        [root presentViewController:a animated:YES completion:nil];
     });
 }
 
-+ (void)dumpClass {
-    [self prompt:@"Dump métodos" placeholder:@"IGMedia"
-          action:^(NSString *name){
-        dispatch_async(dispatch_get_global_queue(
-            DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-            dump_class_methods(name.UTF8String);
-        });
-    }];
++ (void)copyL {
+    UIPasteboard.generalPasteboard.string = [g_termL text];
+    LOGL(@"[L] copiado al portapapeles");
 }
 
-+ (void)dumpIvars {
-    [self prompt:@"Dump ivars" placeholder:@"IGMedia"
-          action:^(NSString *name){
-        dispatch_async(dispatch_get_global_queue(
-            DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-            dump_class_ivars(name.UTF8String);
-        });
-    }];
-}
-
-+ (void)copyLog {
-    [g_lock lock];
-    NSString *text = [g_log copy];
-    [g_lock unlock];
-    dispatch_async(dispatch_get_main_queue(), ^{
-        UIPasteboard.generalPasteboard.string = text ?: @"";
-        add_log(@"[COPY] log al portapapeles");
+// ── Pestaña H (Hook) ──  Run = force-0 por nombre, Stop = quita todos
++ (void)hookRun {
+    NSString *nm = g_hookField.text;
+    [g_hookField resignFirstResponder];
+    dispatch_async(dispatch_get_global_queue(
+        DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        if(!nm.length) { LOGH(@"[H] escribí un símbolo"); return; }
+        if(force0_add(nm.UTF8String))
+            LOGH([NSString stringWithFormat:
+                @"[H] %@ -> 0  (activos: %d)", nm, g_force_n]);
+        else
+            LOGH([NSString stringWithFormat:
+                @"[H] %@ no está en el GOT (interno o mal escrito)",
+                nm]);
     });
 }
 
++ (void)hookStop {
+    dispatch_async(dispatch_get_global_queue(
+        DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        force0_clear_all();
+        LOGH(@"[H] hooks quitados");
+    });
+}
+
++ (void)clearH { [g_termH clearAll]; }
+
+// ── Pestaña D (Dump) ──  Dump / Ivars / GOT sobre el campo de texto
++ (void)dDump {
+    NSString *n = g_dumpField.text;
+    [g_dumpField resignFirstResponder];
+    dispatch_async(dispatch_get_global_queue(
+        DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        dump_class_methods(n.UTF8String);
+    });
+}
+
++ (void)dIvars {
+    NSString *n = g_dumpField.text;
+    [g_dumpField resignFirstResponder];
+    dispatch_async(dispatch_get_global_queue(
+        DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        dump_class_ivars(n.UTF8String);
+    });
+}
+
++ (void)dGot {
+    NSString *f = g_dumpField.text;
+    [g_dumpField resignFirstResponder];
+    dispatch_async(dispatch_get_global_queue(
+        DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        read_got_filtered(f.length ? f.UTF8String : NULL);
+    });
+}
+
++ (void)clearD { [g_termD clearAll]; }
+
+// ── FAB arrastrable ──
 + (void)fabDragged:(UIPanGestureRecognizer*)pan {
     CGPoint t = [pan translationInView:g_window];
-    CGPoint newCenter = CGPointMake(
-        g_fab.center.x + t.x,
-        g_fab.center.y + t.y);
-    // Mantener dentro de la pantalla
+    CGPoint c = CGPointMake(g_fab.center.x + t.x,
+                            g_fab.center.y + t.y);
     CGFloat r = g_fab.bounds.size.width / 2;
     CGRect  b = g_window.bounds;
-    newCenter.x = MAX(r, MIN(b.size.width-r,
-                             newCenter.x));
-    newCenter.y = MAX(r+44, MIN(b.size.height-r,
-                               newCenter.y));
-    g_fab.center = newCenter;
-    [pan setTranslation:CGPointZero
-                 inView:g_window];
+    c.x = MAX(r, MIN(b.size.width-r, c.x));
+    c.y = MAX(r+44, MIN(b.size.height-r, c.y));
+    g_fab.center = c;
+    [pan setTranslation:CGPointZero inView:g_window];
+}
+
+// ── Teclado: subir el panel si el campo queda tapado ──
++ (void)kbShow:(NSNotification*)n {
+    CGRect kb = [n.userInfo[UIKeyboardFrameEndUserInfoKey]
+        CGRectValue];
+    CGFloat overlap =
+        CGRectGetMaxY(g_panel.frame) - kb.origin.y + 8;
+    if(overlap > 0)
+        [UIView animateWithDuration:0.25 animations:^{
+            g_panel.transform =
+                CGAffineTransformMakeTranslation(0, -overlap);
+        }];
+}
++ (void)kbHide:(NSNotification*)n {
+    [UIView animateWithDuration:0.25 animations:^{
+        g_panel.transform = CGAffineTransformIdentity;
+    }];
 }
 
 @end
 
+// ── Helpers de construcción de UI ──
+static UIButton *mkbtn(NSString *title, SEL sel,
+                       CGRect frame, UIColor *color) {
+    UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+    b.frame = frame;
+    b.backgroundColor = color;
+    b.layer.cornerRadius = 6;
+    [b setTitle:title forState:UIControlStateNormal];
+    [b setTitleColor:UIColor.whiteColor
+            forState:UIControlStateNormal];
+    b.titleLabel.font = [UIFont
+        monospacedSystemFontOfSize:11 weight:UIFontWeightBold];
+    [b addTarget:DisasmController.class action:sel
+    forControlEvents:UIControlEventTouchUpInside];
+    return b;
+}
+
+static UITextField *mkfield(NSString *ph, CGRect frame) {
+    UITextField *tf = [[UITextField alloc] initWithFrame:frame];
+    tf.placeholder = ph;
+    tf.backgroundColor = [UIColor colorWithWhite:0.12 alpha:1];
+    tf.textColor = UIColor.whiteColor;
+    tf.font = [UIFont monospacedSystemFontOfSize:12
+                                          weight:UIFontWeightRegular];
+    tf.layer.cornerRadius = 6;
+    tf.autocorrectionType = UITextAutocorrectionTypeNo;
+    tf.autocapitalizationType = UITextAutocapitalizationTypeNone;
+    tf.clearButtonMode = UITextFieldViewModeWhileEditing;
+    UIView *pad = [[UIView alloc]
+        initWithFrame:CGRectMake(0,0,10,1)];
+    tf.leftView = pad; tf.leftViewMode = UITextFieldViewModeAlways;
+    return tf;
+}
+
 // ── Build UI ──
 static void build_ui(void) {
-    // Atar a la escena activa. Sin esto, en iOS 13+ una UIWindow
-    // suelta puede NO mostrarse (causa probable del "desapareció
-    // hoy": si a los 3s no había escena activa, la ventana se crea
-    // pero nunca se pinta).
+    // Atar a la escena activa (si no, la ventana puede no pintarse).
     UIWindowScene *scene = nil;
-    for(UIScene *s in UIApplication.sharedApplication.connectedScenes) {
+    for(UIScene *s in
+        UIApplication.sharedApplication.connectedScenes) {
         if([s isKindOfClass:UIWindowScene.class] &&
            s.activationState ==
                UISceneActivationStateForegroundActive) {
-            scene = (UIWindowScene *)s;
-            break;
+            scene = (UIWindowScene *)s; break;
         }
     }
     if(!scene) {
-        // ninguna escena activa todavía: reintentar en 1s
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
             (int64_t)(1 * NSEC_PER_SEC)),
             dispatch_get_main_queue(), ^{ build_ui(); });
@@ -933,8 +886,7 @@ static void build_ui(void) {
     g_window = [[PassthroughWindow alloc]
         initWithWindowScene:scene];
     g_window.frame = screen;
-    g_window.windowLevel =
-        UIWindowLevelAlert + 200;
+    g_window.windowLevel = UIWindowLevelNormal + 1;
     g_window.backgroundColor = UIColor.clearColor;
 
     UIViewController *vc = [UIViewController new];
@@ -943,203 +895,165 @@ static void build_ui(void) {
 
     // ── FAB ──
     CGFloat fab_sz = 52;
-    g_fab = [[UIButton alloc]
-        initWithFrame:CGRectMake(
-            W - fab_sz - 12,
-            H * 0.38,
-            fab_sz, fab_sz)];
+    g_fab = [[UIButton alloc] initWithFrame:CGRectMake(
+        W - fab_sz - 12, H * 0.38, fab_sz, fab_sz)];
     g_fab.backgroundColor =
-        [UIColor colorWithRed:0
-                        green:0.85
-                         blue:0.45
-                        alpha:0.93];
+        [UIColor colorWithRed:0 green:0.85 blue:0.45 alpha:0.93];
     g_fab.layer.cornerRadius = fab_sz / 2;
-    g_fab.layer.shadowColor  =
-        UIColor.blackColor.CGColor;
+    g_fab.layer.shadowColor = UIColor.blackColor.CGColor;
     g_fab.layer.shadowOpacity = 0.5;
-    g_fab.layer.shadowRadius  = 8;
-    g_fab.layer.shadowOffset  =
-        CGSizeMake(0, 4);
-    [g_fab setTitle:@"="
-           forState:UIControlStateNormal];
+    g_fab.layer.shadowRadius = 8;
+    g_fab.layer.shadowOffset = CGSizeMake(0, 4);
+    [g_fab setTitle:@"=" forState:UIControlStateNormal];
     g_fab.titleLabel.font =
-        [UIFont systemFontOfSize:22
-                          weight:UIFontWeightBold];
+        [UIFont systemFontOfSize:22 weight:UIFontWeightBold];
     [g_fab setTitleColor:UIColor.blackColor
                 forState:UIControlStateNormal];
     [g_fab addTarget:DisasmController.class
               action:@selector(togglePanel)
     forControlEvents:UIControlEventTouchUpInside];
-
-    UIPanGestureRecognizer *pan =
-        [[UIPanGestureRecognizer alloc]
-            initWithTarget:DisasmController.class
-                    action:@selector(fabDragged:)];
-    [g_fab addGestureRecognizer:pan];
+    [g_fab addGestureRecognizer:[[UIPanGestureRecognizer alloc]
+        initWithTarget:DisasmController.class
+                action:@selector(fabDragged:)]];
     [g_window addSubview:g_fab];
 
     // ── Panel ──
     CGFloat pw = W - 24;
-    CGFloat ph = H * 0.6;
-    g_panel = [[UIView alloc]
-        initWithFrame:CGRectMake(
-            12, H - ph - 20, pw, ph)];
+    CGFloat ph = H * 0.62;
+    g_panel = [[UIView alloc] initWithFrame:CGRectMake(
+        12, H - ph - 20, pw, ph)];
     g_panel.backgroundColor =
-        [UIColor colorWithRed:0.04
-                        green:0.04
-                         blue:0.04
-                        alpha:0.97];
+        [UIColor colorWithWhite:0.04 alpha:0.97];
     g_panel.layer.cornerRadius = 14;
-    g_panel.layer.borderWidth  = 1;
-    g_panel.layer.borderColor  =
-        [UIColor colorWithRed:0
-                        green:0.85
-                         blue:0.45
-                        alpha:0.4].CGColor;
+    g_panel.layer.borderWidth = 1;
+    g_panel.layer.borderColor =
+        [UIColor colorWithRed:0 green:0.85 blue:0.45 alpha:0.4].CGColor;
     g_panel.hidden = YES;
-    g_panel.alpha  = 0;
+    g_panel.alpha = 0;
 
     // Header
     UILabel *hdr = [UILabel new];
-    hdr.frame = CGRectMake(12, 12, pw-24, 22);
+    hdr.frame = CGRectMake(12, 10, pw-24, 20);
     hdr.text = [NSString stringWithFormat:
-        @"◈ LIVE TRACER — %@", g_appname ?: @"app"];
+        @"◈ FLEXING — %@", g_appname ?: @"app"];
     hdr.font = [UIFont monospacedSystemFontOfSize:11
                                            weight:UIFontWeightBold];
     hdr.textColor =
-        [UIColor colorWithRed:0
-                        green:0.85
-                         blue:0.45
-                        alpha:1];
+        [UIColor colorWithRed:0 green:0.85 blue:0.45 alpha:1];
     [g_panel addSubview:hdr];
 
-    // Botones
-    NSArray *titles  = @[@"TRACE", @"GOT", @"CLEAR",
-                         @"HOOK",  @"SWZ", @"SAVE",
-                         @"DUMP",  @"IVARS", @"COPY"];
-    NSArray *sels    = @[@"toggleTrace", @"readGOT", @"clearLog",
-                         @"installHook", @"installSwizzle",
-                         @"saveLog",
-                         @"dumpClass", @"dumpIvars", @"copyLog"];
-    NSArray *colors  = @[
-        [UIColor colorWithRed:0.1 green:0.5
-                        blue:0.1 alpha:1],   // TRACE
-        [UIColor colorWithRed:0.4 green:0.1
-                        blue:0.5 alpha:1],   // GOT
-        [UIColor colorWithRed:0.3 green:0.3
-                        blue:0.3 alpha:1],   // CLEAR
-        [UIColor colorWithRed:0.7 green:0.4
-                        blue:0.05 alpha:1],  // HOOK
-        [UIColor colorWithRed:0.05 green:0.5
-                        blue:0.5 alpha:1],   // SWZ
-        [UIColor colorWithRed:0.1 green:0.2
-                        blue:0.6 alpha:1],   // SAVE
-        [UIColor colorWithRed:0.15 green:0.45
-                        blue:0.35 alpha:1],  // DUMP
-        [UIColor colorWithRed:0.35 green:0.35
-                        blue:0.15 alpha:1],  // IVARS
-        [UIColor colorWithRed:0.35 green:0.35
-                        blue:0.4 alpha:1],   // COPY
-    ];
-    CGFloat bw = (pw - 28) / 3.0;            // 3 por fila
-    for(int i = 0; i < 9; i++) {
-        int row = i / 3;
-        int col = i % 3;
-        UIButton *b = [UIButton
-            buttonWithType:UIButtonTypeSystem];
-        b.frame = CGRectMake(
-            10 + col*(bw+4), 40 + row*36, bw, 32);
-        b.backgroundColor = colors[i];
-        b.layer.cornerRadius = 6;
-        [b setTitle:titles[i]
-           forState:UIControlStateNormal];
-        [b setTitleColor:UIColor.whiteColor
-                forState:UIControlStateNormal];
-        b.titleLabel.font =
-            [UIFont monospacedSystemFontOfSize:10
-                                        weight:UIFontWeightBold];
-        [b addTarget:DisasmController.class
-              action:NSSelectorFromString(sels[i])
-    forControlEvents:UIControlEventTouchUpInside];
-        if(i == 0) b.tag = 200;   // TRACE (toggle PAUSE)
-        if(i == 3) b.tag = 201;   // HOOK  (toggle UNHOOK)
-        if(i == 4) b.tag = 202;   // SWZ   (toggle UNSWZ)
-        [g_panel addSubview:b];
-    }
+    // Selector L / H / D
+    UISegmentedControl *seg = [[UISegmentedControl alloc]
+        initWithItems:@[@"L", @"H", @"D"]];
+    seg.frame = CGRectMake(10, 36, pw-20, 30);
+    seg.selectedSegmentIndex = 0;
+    [seg addTarget:DisasmController.class
+            action:@selector(switchTab:)
+  forControlEvents:UIControlEventValueChanged];
+    [g_panel addSubview:seg];
 
-    // TextView
-    CGFloat tv_y = 156;
-    g_textview = [[UITextView alloc]
-        initWithFrame:CGRectMake(
-            6, tv_y,
-            pw-12, ph-tv_y-8)];
-    g_textview.backgroundColor =
-        [UIColor colorWithRed:0.02
-                        green:0.02
-                         blue:0.02
-                        alpha:1];
-    g_textview.textColor =
-        [UIColor colorWithRed:0
-                        green:0.9
-                         blue:0.5
-                        alpha:1];
-    g_textview.font =
-        [UIFont monospacedSystemFontOfSize:9
-                                    weight:UIFontWeightRegular];
-    g_textview.editable = NO;
-    g_textview.layer.cornerRadius = 8;
-    g_textview.text =
-        @"// Toca TRACE para iniciar\n"
-        @"// Solo threads de la app target\n";
-    [g_panel addSubview:g_textview];
+    // Geometría común
+    CGFloat ctl_y = 74;                 // fila de controles
+    CGFloat term_y = 146;               // terminal
+    CGFloat term_h = ph - term_y - 8;
+    CGFloat b3 = (pw - 28) / 3.0;       // ancho de 3 botones
+
+    UIColor *cGreen  = [UIColor colorWithRed:0.1 green:0.5 blue:0.1 alpha:1];
+    UIColor *cGray   = [UIColor colorWithWhite:0.3 alpha:1];
+    UIColor *cBlue   = [UIColor colorWithRed:0.1 green:0.2 blue:0.6 alpha:1];
+    UIColor *cSlate  = [UIColor colorWithRed:0.35 green:0.35 blue:0.4 alpha:1];
+    UIColor *cOrange = [UIColor colorWithRed:0.7 green:0.4 blue:0.05 alpha:1];
+    UIColor *cRed    = [UIColor colorWithRed:0.6 green:0.12 blue:0.12 alpha:1];
+    UIColor *cTeal   = [UIColor colorWithRed:0.05 green:0.5 blue:0.5 alpha:1];
+    UIColor *cOlive  = [UIColor colorWithRed:0.35 green:0.35 blue:0.15 alpha:1];
+    UIColor *cPurple = [UIColor colorWithRed:0.4 green:0.1 blue:0.5 alpha:1];
+
+    // ── Controles L: TRACE / CLEAR / SAVE / COPY ──
+    g_ctlL = [[UIView alloc] initWithFrame:
+        CGRectMake(0, ctl_y, pw, 40)];
+    {
+        CGFloat w = (pw - 32) / 4.0;
+        UIButton *bt = mkbtn(@"TRACE", @selector(toggleTrace),
+            CGRectMake(10, 0, w, 32), cGreen);
+        bt.tag = 200;
+        [g_ctlL addSubview:bt];
+        [g_ctlL addSubview:mkbtn(@"CLEAR", @selector(clearL),
+            CGRectMake(10+(w+4), 0, w, 32), cGray)];
+        [g_ctlL addSubview:mkbtn(@"SAVE", @selector(saveL),
+            CGRectMake(10+2*(w+4), 0, w, 32), cBlue)];
+        [g_ctlL addSubview:mkbtn(@"COPY", @selector(copyL),
+            CGRectMake(10+3*(w+4), 0, w, 32), cSlate)];
+    }
+    [g_panel addSubview:g_ctlL];
+
+    // ── Controles H: campo + RUN / STOP / CLEAR ──
+    g_ctlH = [[UIView alloc] initWithFrame:
+        CGRectMake(0, ctl_y, pw, 72)];
+    g_hookField = mkfield(@"símbolo C (ej: METADeviceIsJailbroken)",
+        CGRectMake(10, 0, pw-20, 32));
+    [g_ctlH addSubview:g_hookField];
+    [g_ctlH addSubview:mkbtn(@"RUN", @selector(hookRun),
+        CGRectMake(10, 38, b3, 30), cOrange)];
+    [g_ctlH addSubview:mkbtn(@"STOP", @selector(hookStop),
+        CGRectMake(10+(b3+4), 38, b3, 30), cRed)];
+    [g_ctlH addSubview:mkbtn(@"CLEAR", @selector(clearH),
+        CGRectMake(10+2*(b3+4), 38, b3, 30), cGray)];
+    g_ctlH.hidden = YES;
+    [g_panel addSubview:g_ctlH];
+
+    // ── Controles D: campo + DUMP / IVARS / GOT (+CLEAR) ──
+    g_ctlD = [[UIView alloc] initWithFrame:
+        CGRectMake(0, ctl_y, pw, 72)];
+    g_dumpField = mkfield(@"clase (IGMedia) o filtro GOT (Jailbroken)",
+        CGRectMake(10, 0, pw-20, 32));
+    [g_ctlD addSubview:g_dumpField];
+    [g_ctlD addSubview:mkbtn(@"DUMP", @selector(dDump),
+        CGRectMake(10, 38, b3, 30), cTeal)];
+    [g_ctlD addSubview:mkbtn(@"IVARS", @selector(dIvars),
+        CGRectMake(10+(b3+4), 38, b3, 30), cOlive)];
+    [g_ctlD addSubview:mkbtn(@"GOT", @selector(dGot),
+        CGRectMake(10+2*(b3+4), 38, b3, 30), cPurple)];
+    g_ctlD.hidden = YES;
+    [g_panel addSubview:g_ctlD];
+
+    // ── Tres terminales (misma zona, se muestra la activa) ──
+    CGRect tf = CGRectMake(6, term_y, pw-12, term_h);
+    g_termL = [[TermView alloc] initWithFrame:tf];
+    g_termH = [[TermView alloc] initWithFrame:tf];
+    g_termD = [[TermView alloc] initWithFrame:tf];
+    g_termH.hidden = YES;
+    g_termD.hidden = YES;
+    [g_panel addSubview:g_termL];
+    [g_panel addSubview:g_termH];
+    [g_panel addSubview:g_termD];
+
     [g_window addSubview:g_panel];
     [g_window makeKeyAndVisible];
 
-    // Timer UI refresh
-    NSTimer *timer = [NSTimer
-        scheduledTimerWithTimeInterval:0.5
-                               repeats:YES
-                                 block:^(NSTimer *t){
-        update_ui();
-    }];
-    [[NSRunLoop mainRunLoop] addTimer:timer
-                              forMode:NSRunLoopCommonModes];
+    // Teclado
+    [[NSNotificationCenter defaultCenter]
+        addObserver:DisasmController.class
+           selector:@selector(kbShow:)
+               name:UIKeyboardWillShowNotification object:nil];
+    [[NSNotificationCenter defaultCenter]
+        addObserver:DisasmController.class
+           selector:@selector(kbHide:)
+               name:UIKeyboardWillHideNotification object:nil];
+
+    // Intro en L
+    LOGL([NSString stringWithFormat:@"App:  %@", g_appname ?: @"?"]);
+    LOGL([NSString stringWithFormat:@"Base: 0x%llx", g_base]);
+    LOGL(@"─────────────────────────");
+    LOGL(@"L=Log  H=Hook  D=Dump. Toca TRACE.");
 }
 
 // ── CTOR ──
 %ctor {
-    // MARCADOR de diagnóstico: si aparece este archivo con hora de
-    // hoy, el %ctor SÍ corre (o sea el dylib se inyectó bien).
-    [@"ctor ok" writeToFile:[NSHomeDirectory()
-        stringByAppendingPathComponent:@"Documents/tracer_marker.txt"]
-        atomically:YES encoding:NSUTF8StringEncoding error:nil];
-
-    g_log  = [NSMutableString new];
-    g_lock = [NSLock new];
-
     find_base();
-
-    add_log([NSString stringWithFormat:
-        @"Bundle: %@",
-        NSBundle.mainBundle.bundleIdentifier]);
-    add_log([NSString stringWithFormat:
-        @"Base:   0x%llx", g_base]);
-    add_log([NSString stringWithFormat:
-        @"App:    %@", g_appname ?: @"?"]);
-    add_log(@"─────────────────────────");
-    add_log(@"Ready. Toca TRACE.");
-
     atomic_store(&g_running, true);
-    pthread_create(&g_thread, NULL,
-                   tracer_thread, NULL);
+    pthread_create(&g_thread, NULL, tracer_thread, NULL);
     pthread_detach(g_thread);
-
-    dispatch_after(
-        dispatch_time(DISPATCH_TIME_NOW,
-            (int64_t)(3 * NSEC_PER_SEC)),
-        dispatch_get_main_queue(), ^{
-        build_ui();
-    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+        (int64_t)(3 * NSEC_PER_SEC)),
+        dispatch_get_main_queue(), ^{ build_ui(); });
 }
-
-
