@@ -1257,7 +1257,7 @@ static void build_ui(void) {
 
     // ── Panel ──
     CGFloat pw = W - 24;
-    CGFloat ph = H * 0.80;
+    CGFloat ph = H * 0.74;
     g_panel = [[UIView alloc] initWithFrame:CGRectMake(
         12, H - ph - 20, pw, ph)];
     g_panel.backgroundColor =
@@ -1352,28 +1352,30 @@ static void build_ui(void) {
     g_ctlH.hidden = YES;
     [g_panel addSubview:g_ctlH];
 
-    // ── Controles D: campo + DUMP / IVARS / GOT + PICK ──
+    // ── Controles D: campo + DUMP / IVARS / GOT / PICK (1 fila) ──
     g_ctlD = [[UIView alloc] initWithFrame:
-        CGRectMake(0, ctl_y, pw, 108)];
+        CGRectMake(0, ctl_y, pw, 72)];
     g_dumpField = mkfield(@"clase (IGMedia) o filtro GOT (Jailbroken)",
         CGRectMake(10, 0, pw-20, 32));
     [g_ctlD addSubview:g_dumpField];
-    [g_ctlD addSubview:mkbtn(@"DUMP", @selector(dDump),
-        CGRectMake(10, 38, b3, 30), cTeal)];
-    [g_ctlD addSubview:mkbtn(@"IVARS", @selector(dIvars),
-        CGRectMake(10+(b3+4), 38, b3, 30), cOlive)];
-    [g_ctlD addSubview:mkbtn(@"GOT", @selector(dGot),
-        CGRectMake(10+2*(b3+4), 38, b3, 30), cPurple)];
-    [g_ctlD addSubview:mkbtn(@"PICK  (tocá una vista)",
-        @selector(pickToggle),
-        CGRectMake(10, 72, pw-20, 30),
-        [UIColor colorWithRed:0.1 green:0.55 blue:0.3 alpha:1])];
+    {
+        CGFloat w = (pw - 32) / 4.0;
+        [g_ctlD addSubview:mkbtn(@"DUMP", @selector(dDump),
+            CGRectMake(10, 38, w, 30), cTeal)];
+        [g_ctlD addSubview:mkbtn(@"IVARS", @selector(dIvars),
+            CGRectMake(10+(w+4), 38, w, 30), cOlive)];
+        [g_ctlD addSubview:mkbtn(@"GOT", @selector(dGot),
+            CGRectMake(10+2*(w+4), 38, w, 30), cPurple)];
+        [g_ctlD addSubview:mkbtn(@"PICK", @selector(pickToggle),
+            CGRectMake(10+3*(w+4), 38, w, 30),
+            [UIColor colorWithRed:0.1 green:0.6 blue:0.3 alpha:1])];
+    }
     g_ctlD.hidden = YES;
     [g_panel addSubview:g_ctlD];
 
-    // ── Terminales. H arranca más abajo (sus controles son altos) ──
+    // ── Terminales. Solo H arranca más abajo (controles altos) ──
     CGRect tfLD = CGRectMake(6, term_y, pw-12, term_h);
-    CGFloat hterm_y = ctl_y + 196;
+    CGFloat hterm_y = ctl_y + 196;   // H: 3 campos + 2 filas botones
     CGRect tfH = CGRectMake(6, hterm_y, pw-12, ph - hterm_y - 8);
     g_termL = [[TermView alloc] initWithFrame:tfLD];
     g_termH = [[TermView alloc] initWithFrame:tfH];
@@ -1425,3 +1427,5 @@ static void build_ui(void) {
         (int64_t)(3 * NSEC_PER_SEC)),
         dispatch_get_main_queue(), ^{ build_ui(); });
 }
+
+
