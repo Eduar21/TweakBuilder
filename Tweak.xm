@@ -76,7 +76,7 @@ static void find_base(void) {
             [UIColor colorWithRed:0.3 green:1
                              blue:0.45 alpha:1];
         _tv.font = [UIFont
-            monospacedSystemFontOfSize:10
+            monospacedSystemFontOfSize:11
                                 weight:UIFontWeightRegular];
         _tv.editable = NO;
         _tv.layer.cornerRadius = 8;
@@ -664,9 +664,30 @@ NSString *cat = categorize(sym);
 @end
 @implementation DisasmController
 
+// Coloca el panel pegado al FAB: si el FAB está en la mitad de
+// arriba, el panel cae hacia abajo; si está abajo, sube. Clamp a
+// pantalla. (Opción A: el menú sigue al botón.)
++ (void)repositionPanel {
+    if(!g_panel || !g_fab) return;
+    CGFloat H  = g_window.bounds.size.height;
+    CGFloat ph = g_panel.frame.size.height;
+    CGFloat pw = g_panel.frame.size.width;
+    CGFloat px = g_panel.frame.origin.x;
+    CGRect  fab = g_fab.frame;
+    CGFloat py = (g_fab.center.y < H/2)
+        ? CGRectGetMaxY(fab) + 10          // FAB arriba -> panel abajo
+        : CGRectGetMinY(fab) - ph - 10;    // FAB abajo  -> panel arriba
+    CGFloat topSafe = 50, botSafe = H - 10;
+    if(py + ph > botSafe) py = botSafe - ph;
+    if(py < topSafe)      py = topSafe;
+    g_panel.transform = CGAffineTransformIdentity;
+    g_panel.frame = CGRectMake(px, py, pw, ph);
+}
+
 + (void)togglePanel {
     g_expanded = !g_expanded;
     if(g_expanded) {
+        [self repositionPanel];            // pegarse al FAB
         g_panel.hidden = NO;
         g_panel.alpha  = 0;
         [UIView animateWithDuration:0.2 animations:^{
@@ -804,6 +825,7 @@ NSString *cat = categorize(sym);
     c.y = MAX(r+44, MIN(b.size.height-r, c.y));
     g_fab.center = c;
     [pan setTranslation:CGPointZero inView:g_window];
+    if(g_expanded) [self repositionPanel];   // el panel sigue al FAB
 }
 
 // ── Teclado: subir el panel si el campo queda tapado ──
@@ -919,7 +941,7 @@ static void build_ui(void) {
 
     // ── Panel ──
     CGFloat pw = W - 24;
-    CGFloat ph = H * 0.62;
+    CGFloat ph = H * 0.72;
     g_panel = [[UIView alloc] initWithFrame:CGRectMake(
         12, H - ph - 20, pw, ph)];
     g_panel.backgroundColor =
