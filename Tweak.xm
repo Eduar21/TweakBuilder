@@ -479,8 +479,8 @@ static objchook_t *ohook_for(id self, SEL _cmd) {
     Class c = object_getClass(self);
     for(int i = 0; i < g_ohooks_n; i++) {
         if(g_ohooks[i].sel != _cmd) continue;
-        if(c == (Class)g_ohooks[i].cls) return &g_ohooks[i];
-        if([self isKindOfClass:(Class)g_ohooks[i].cls])
+        if(c == (__bridge Class)g_ohooks[i].cls) return &g_ohooks[i];
+        if([self isKindOfClass:(__bridge Class)g_ohooks[i].cls])
             return &g_ohooks[i];
     }
     return NULL;
@@ -510,7 +510,7 @@ static int objc_hook_add(const char *cn, const char *sn,
     char ret = *enc;
 
     objchook_t h; memset(&h, 0, sizeof(h));
-    h.cls = (void*)cls; h.sel = sel;
+    h.cls = (__bridge void*)cls; h.sel = sel;
     IMP tramp = NULL;
     switch(ret) {
         case 'B': case 'c': case 'C':
@@ -536,7 +536,7 @@ static int objc_hook_add(const char *cn, const char *sn,
 static void objc_hook_clear_all(void) {
     for(int i = 0; i < g_ohooks_n; i++) {
         Method m = class_getInstanceMethod(
-            (Class)g_ohooks[i].cls, g_ohooks[i].sel);
+            (__bridge Class)g_ohooks[i].cls, g_ohooks[i].sel);
         if(m && g_ohooks[i].orig)
             method_setImplementation(m, g_ohooks[i].orig);
     }
@@ -1202,4 +1202,3 @@ static void build_ui(void) {
         (int64_t)(3 * NSEC_PER_SEC)),
         dispatch_get_main_queue(), ^{ build_ui(); });
 }
-
