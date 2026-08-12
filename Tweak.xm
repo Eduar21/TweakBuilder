@@ -486,14 +486,52 @@ static objchook_t *ohook_for(id self, SEL _cmd) {
     return NULL;
 }
 
-// Trampolines por tipo de retorno (fuerzan, no llaman al original).
+// ¿self es parte de NUESTRO menú? Si sí, el hook no debe tocarlo
+// (evita quedar encerrado, ej: forzar UIControl.isEnabled=NO).
+static BOOL is_our_ui(id self) {
+    static __thread int reent = 0;
+    if(reent) return NO;
+    reent = 1;
+    BOOL r = NO;
+    if([self isKindOfClass:UIView.class]) {
+        UIView *v = (UIView*)self;
+        for(UIView *p = v; p; p = p.superview) {
+            if(p == g_panel || p == g_fab) { r = YES; break; }
+        }
+        if(!r && v.window && v.window == g_window) r = YES;
+    }
+    reent = 0;
+    return r;
+}
+
+// Trampolines por tipo de retorno (fuerzan, salvo en nuestro menú).
 static long long ohook_int(id self, SEL _cmd){
-    objchook_t *h = ohook_for(self,_cmd); return h ? h->ival : 0; }
+    objchook_t *h = ohook_for(self,_cmd);
+    if(!h) return 0;
+    if(is_our_ui(self)) {
+        long long (*o)(id,SEL) = (long long(*)(id,SEL))h->orig;
+        return o(self,_cmd);
+    }
+    return h->ival;
+}
 static double ohook_dbl(id self, SEL _cmd){
-    objchook_t *h = ohook_for(self,_cmd); return h ? h->dval : 0; }
+    objchook_t *h = ohook_for(self,_cmd);
+    if(!h) return 0;
+    if(is_our_ui(self)) {
+        double (*o)(id,SEL) = (double(*)(id,SEL))h->orig;
+        return o(self,_cmd);
+    }
+    return h->dval;
+}
 static float ohook_flt(id self, SEL _cmd){
     objchook_t *h = ohook_for(self,_cmd);
-    return h ? (float)h->dval : 0; }
+    if(!h) return 0;
+    if(is_our_ui(self)) {
+        float (*o)(id,SEL) = (float(*)(id,SEL))h->orig;
+        return o(self,_cmd);
+    }
+    return (float)h->dval;
+}
 
 // 1=ok  -1=clase  -2=método  -3=retorno no soportado  -4=lleno
 static int objc_hook_add(const char *cn, const char *sn,
@@ -541,6 +579,60 @@ static void objc_hook_clear_all(void) {
             method_setImplementation(m, g_ohooks[i].orig);
     }
     g_ohooks_n = 0;
+}
+
+// Quita un hook ObjC puntual por clase+selector.
+static BOOL objc_hook_remove(const char *cn, const char *sn) {
+    Class cls = objc_getClass(cn);
+    if(!cls) return NO;
+    SEL sel = sel_registerName(sn);
+    for(int i = 0; i < g_ohooks_n; i++) {
+        if((__bridge Class)g_ohooks[i].cls == cls &&
+           g_ohooks[i].sel == sel) {
+            Method m = class_getInstanceMethod(cls, sel);
+            if(m && g_ohooks[i].orig)
+                method_setImplementation(m, g_ohooks[i].orig);
+            for(int j = i; j < g_ohooks_n-1; j++)
+                g_ohooks[j] = g_ohooks[j+1];
+            g_ohooks_n--;
+            return YES;
+        }
+    }
+    return NO;
+}
+
+// Quita un force-0 GOT puntual por símbolo.
+static BOOL force0_remove(const char *name) {
+    for(int i = 0; i < g_force_n; i++) {
+        if(strcmp(g_force[i].name, name) == 0) {
+            got_unhook(g_force[i].slot, g_force[i].orig);
+            for(int j = i; j < g_force_n-1; j++)
+                g_force[j] = g_force[j+1];
+            g_force_n--;
+            return YES;
+        }
+    }
+    return NO;
+}
+
+// Lista los hooks activos en la terminal H.
+static void hooks_list(void) {
+    LOGH([NSString stringWithFormat:
+        @"── activos: %d ObjC · %d GOT ──",
+        g_ohooks_n, g_force_n]);
+    for(int i = 0; i < g_ohooks_n; i++) {
+        const char *cn = class_getName(
+            (__bridge Class)g_ohooks[i].cls);
+        const char *sn = sel_getName(g_ohooks[i].sel);
+        NSString *val = (g_ohooks[i].kind == 0)
+            ? [NSString stringWithFormat:@"%lld", g_ohooks[i].ival]
+            : [NSString stringWithFormat:@"%g", g_ohooks[i].dval];
+        LOGH([NSString stringWithFormat:
+            @"  objc -[%s %s] -> %@", cn, sn, val]);
+    }
+    for(int i = 0; i < g_force_n; i++)
+        LOGH([NSString stringWithFormat:
+            @"  GOT  %s -> 0", g_force[i].name]);
 }
 
 // ════════════════════════════════════════════
@@ -893,8 +985,31 @@ NSString *cat = categorize(sym);
         DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         objc_hook_clear_all();
         force0_clear_all();
-        LOGH(@"[H] todos los hooks quitados");
+        LOGH(@"[H] TODOS los hooks quitados");
     });
+}
+
+// Quita UN hook: el que matchee clase(+selector). Sin selector = GOT.
++ (void)hookOff {
+    NSString *c = g_hkCls.text;
+    NSString *s = g_hkSel.text;
+    [g_panel endEditing:YES];
+    dispatch_async(dispatch_get_global_queue(
+        DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        if(!c.length) { LOGH(@"[H] escribí clase o símbolo a quitar"); return; }
+        BOOL ok = s.length
+            ? objc_hook_remove(c.UTF8String, s.UTF8String)
+            : force0_remove(c.UTF8String);
+        LOGH(ok
+            ? [NSString stringWithFormat:@"[H] quitado: %@ %@",
+                c, s.length ? s : @"(GOT)"]
+            : @"[H] no encontré ese hook activo");
+    });
+}
+
++ (void)hookList {
+    dispatch_async(dispatch_get_global_queue(
+        DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{ hooks_list(); });
 }
 
 + (void)clearH { [g_termH clearAll]; }
@@ -1123,9 +1238,9 @@ static void build_ui(void) {
     }
     [g_panel addSubview:g_ctlL];
 
-    // ── Controles H: clase / selector / valor + RUN/STOP/CLEAR ──
+    // ── Controles H: clase / selector / valor + 2 filas de botones ──
     g_ctlH = [[UIView alloc] initWithFrame:
-        CGRectMake(0, ctl_y, pw, 150)];
+        CGRectMake(0, ctl_y, pw, 190)];
     g_hkCls = mkfield(@"Clase (IGMedia)  ·  o símbolo C p/ GOT",
         CGRectMake(10, 0, pw-20, 32));
     g_hkSel = mkfield(@"selector (isChildOfAdItem)  ·  vacío = GOT",
@@ -1135,12 +1250,18 @@ static void build_ui(void) {
     [g_ctlH addSubview:g_hkCls];
     [g_ctlH addSubview:g_hkSel];
     [g_ctlH addSubview:g_hkVal];
+    // fila 1: RUN / OFF / STOP
     [g_ctlH addSubview:mkbtn(@"RUN", @selector(hookRun),
         CGRectMake(10, 116, b3, 30), cOrange)];
+    [g_ctlH addSubview:mkbtn(@"OFF", @selector(hookOff),
+        CGRectMake(10+(b3+4), 116, b3, 30), cSlate)];
     [g_ctlH addSubview:mkbtn(@"STOP", @selector(hookStop),
-        CGRectMake(10+(b3+4), 116, b3, 30), cRed)];
+        CGRectMake(10+2*(b3+4), 116, b3, 30), cRed)];
+    // fila 2: LIST / CLEAR
+    [g_ctlH addSubview:mkbtn(@"LIST", @selector(hookList),
+        CGRectMake(10, 150, b3, 30), cGreen)];
     [g_ctlH addSubview:mkbtn(@"CLEAR", @selector(clearH),
-        CGRectMake(10+2*(b3+4), 116, b3, 30), cGray)];
+        CGRectMake(10+(b3+4), 150, b3, 30), cGray)];
     g_ctlH.hidden = YES;
     [g_panel addSubview:g_ctlH];
 
@@ -1161,7 +1282,7 @@ static void build_ui(void) {
 
     // ── Terminales. H arranca más abajo (sus controles son altos) ──
     CGRect tfLD = CGRectMake(6, term_y, pw-12, term_h);
-    CGFloat hterm_y = ctl_y + 156;
+    CGFloat hterm_y = ctl_y + 196;
     CGRect tfH = CGRectMake(6, hterm_y, pw-12, ph - hterm_y - 8);
     g_termL = [[TermView alloc] initWithFrame:tfLD];
     g_termH = [[TermView alloc] initWithFrame:tfH];
@@ -1202,3 +1323,4 @@ static void build_ui(void) {
         (int64_t)(3 * NSEC_PER_SEC)),
         dispatch_get_main_queue(), ^{ build_ui(); });
 }
+
