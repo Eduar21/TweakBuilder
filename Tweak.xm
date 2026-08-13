@@ -541,7 +541,8 @@ static void rec_install_once(void) {
 typedef struct {
     void     *cls;          // Class (como void*)
     SEL       sel;
-    int       kind;         // 0=int 1=double 2=float
+    int       kind;         // 0=int 1=double 2=float 3=void
+    int       mode;         // 0=force/block (no llama orig) 1=log (llama+loguea)
     long long ival;
     double    dval;
     IMP       orig;
@@ -581,33 +582,65 @@ static BOOL is_our_ui(id self) {
     return r;
 }
 
-// Trampolines por tipo de retorno (fuerzan, salvo en nuestro menú).
+// Trampolines. Reglas: nuestro menú -> siempre orig. mode log ->
+// orig + loguea. mode force -> valor forzado (o swallow si void).
 static long long ohook_int(id self, SEL _cmd){
     objchook_t *h = ohook_for(self,_cmd);
     if(!h) return 0;
-    if(is_our_ui(self)) {
-        long long (*o)(id,SEL) = (long long(*)(id,SEL))h->orig;
-        return o(self,_cmd);
+    if(is_our_ui(self))
+        return ((long long(*)(id,SEL))h->orig)(self,_cmd);
+    if(h->mode == 1) {   // log: ejecutar y mostrar el retorno real
+        long long r = ((long long(*)(id,SEL))h->orig)(self,_cmd);
+        LOGH([NSString stringWithFormat:@"[LOG] -%s → %lld",
+            sel_getName(_cmd), r]);
+        return r;
     }
-    return h->ival;
+    return h->ival;      // force
 }
 static double ohook_dbl(id self, SEL _cmd){
     objchook_t *h = ohook_for(self,_cmd);
     if(!h) return 0;
-    if(is_our_ui(self)) {
-        double (*o)(id,SEL) = (double(*)(id,SEL))h->orig;
-        return o(self,_cmd);
+    if(is_our_ui(self))
+        return ((double(*)(id,SEL))h->orig)(self,_cmd);
+    if(h->mode == 1) {
+        double r = ((double(*)(id,SEL))h->orig)(self,_cmd);
+        LOGH([NSString stringWithFormat:@"[LOG] -%s → %g",
+            sel_getName(_cmd), r]);
+        return r;
     }
     return h->dval;
 }
 static float ohook_flt(id self, SEL _cmd){
     objchook_t *h = ohook_for(self,_cmd);
     if(!h) return 0;
-    if(is_our_ui(self)) {
-        float (*o)(id,SEL) = (float(*)(id,SEL))h->orig;
-        return o(self,_cmd);
+    if(is_our_ui(self))
+        return ((float(*)(id,SEL))h->orig)(self,_cmd);
+    if(h->mode == 1) {
+        float r = ((float(*)(id,SEL))h->orig)(self,_cmd);
+        LOGH([NSString stringWithFormat:@"[LOG] -%s → %g",
+            sel_getName(_cmd), (double)r]);
+        return r;
     }
     return (float)h->dval;
+}
+// void: mode force = BLOCK (swallow, no ejecuta). mode log = ejecuta
+// + avisa. Nuestro menú siempre ejecuta.
+static void ohook_void(id self, SEL _cmd){
+    objchook_t *h = ohook_for(self,_cmd);
+    if(!h) return;
+    if(is_our_ui(self)) {
+        ((void(*)(id,SEL))h->orig)(self,_cmd);
+        return;
+    }
+    if(h->mode == 1) {   // log: ejecutar + avisar
+        LOGH([NSString stringWithFormat:@"[LOG] llamado: -%s",
+            sel_getName(_cmd)]);
+        ((void(*)(id,SEL))h->orig)(self,_cmd);
+        return;
+    }
+    // mode block: no hacer nada (swallow la acción)
+    LOGH([NSString stringWithFormat:@"[BLOCK] -%s (swallow)",
+        sel_getName(_cmd)]);
 }
 
 // ── Resolver de nombres de clase (Swift con módulo) ──
@@ -686,6 +719,7 @@ static int objc_hook_add(const char *cn, const char *sn,
 
     objchook_t h; memset(&h, 0, sizeof(h));
     h.cls = (__bridge void*)cls; h.sel = sel;
+    h.mode = (val && strcmp(val,"log")==0) ? 1 : 0;   // 'log' = observar
     IMP tramp = NULL;
     switch(ret) {
         case 'B': case 'c': case 'C':
@@ -699,13 +733,16 @@ static int objc_hook_add(const char *cn, const char *sn,
         case 'f':
             h.kind = 2; h.dval = atof(val);
             tramp = (IMP)ohook_flt; break;
+        case 'v':
+            h.kind = 3;   // void: block (default) o log
+            tramp = (IMP)ohook_void; break;
         default:
-            return -3;   // @/void/struct/ptr: no soportado aún
+            return -3;   // @/struct/ptr: no soportado aún
     }
     h.orig = swizzle_instance(cls, sel, tramp);
     if(!h.orig) return -2;
     g_ohooks[g_ohooks_n++] = h;
-    return 1;
+    return h.kind == 3 ? (h.mode==1 ? 3 : 2) : 1;  // 2=block 3=log 1=force
 }
 
 static void objc_hook_clear_all(void) {
@@ -761,11 +798,19 @@ static void hooks_list(void) {
         const char *cn = class_getName(
             (__bridge Class)g_ohooks[i].cls);
         const char *sn = sel_getName(g_ohooks[i].sel);
-        NSString *val = (g_ohooks[i].kind == 0)
-            ? [NSString stringWithFormat:@"%lld", g_ohooks[i].ival]
-            : [NSString stringWithFormat:@"%g", g_ohooks[i].dval];
+        NSString *desc;
+        if(g_ohooks[i].mode == 1)
+            desc = @"LOG";
+        else if(g_ohooks[i].kind == 3)
+            desc = @"BLOCK";
+        else if(g_ohooks[i].kind == 0)
+            desc = [NSString stringWithFormat:@"→ %lld",
+                g_ohooks[i].ival];
+        else
+            desc = [NSString stringWithFormat:@"→ %g",
+                g_ohooks[i].dval];
         LOGH([NSString stringWithFormat:
-            @"  objc -[%s %s] -> %@", cn, sn, val]);
+            @"  objc -[%s %s]  %@", cn, sn, desc]);
     }
     for(int i = 0; i < g_force_n; i++)
         LOGH([NSString stringWithFormat:
@@ -1152,13 +1197,19 @@ NSString *cat = categorize(sym);
                                    val, LOGH);
             switch(rc) {
                 case 1: LOGH([NSString stringWithFormat:
-                    @"[H] -[%@ %@] -> %@  ON (activos: %d)",
+                    @"[H] -[%@ %@] → %@  FORCE ON (activos: %d)",
                     c, s, v.length?v:@"0", g_ohooks_n]); break;
-                case -1: break;  // el resolver ya explicó (no encontrada/ambigua)
+                case 2: LOGH([NSString stringWithFormat:
+                    @"[H] -[%@ %@]  BLOCK ON (swallow) (activos: %d)",
+                    c, s, g_ohooks_n]); break;
+                case 3: LOGH([NSString stringWithFormat:
+                    @"[H] -[%@ %@]  LOG ON (pasa + avisa) (activos: %d)",
+                    c, s, g_ohooks_n]); break;
+                case -1: break;  // el resolver ya explicó
                 case -2: LOGH([NSString stringWithFormat:
                     @"[H] método no encontrado: -[%@ %@]", c, s]); break;
                 case -3: LOGH(@"[H] retorno no soportado "
-                    @"(objeto/void/struct — probá un BOOL/int/double)"); break;
+                    @"(objeto/struct — probá BOOL/int/double/void)"); break;
                 case -4: LOGH(@"[H] tabla llena"); break;
                 default: LOGH(@"[H] fallo"); break;
             }
@@ -1481,7 +1532,7 @@ static void build_ui(void) {
         CGRectMake(10, 0, pw-20, 32));
     g_hkSel = mkfield(@"selector (isChildOfAdItem)  ·  vacío = GOT",
         CGRectMake(10, 38, pw-20, 32));
-    g_hkVal = mkfield(@"retorno forzado (0 · 1 · 3.14)",
+    g_hkVal = mkfield(@"retorno (0·1·3.14) · 'log' · vacío=block si void",
         CGRectMake(10, 76, pw-20, 32));
     [g_ctlH addSubview:g_hkCls];
     [g_ctlH addSubview:g_hkSel];
@@ -1576,3 +1627,4 @@ static void build_ui(void) {
         (int64_t)(3 * NSEC_PER_SEC)),
         dispatch_get_main_queue(), ^{ build_ui(); });
 }
+
