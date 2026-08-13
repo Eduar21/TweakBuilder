@@ -40,6 +40,10 @@ static UITextField *g_dumpField = nil;
 static UISegmentedControl *g_seg = nil;
 static BOOL         g_pick_mode = NO;      // inspector por toque
 static UIView      *g_pickCatcher = nil;
+static BOOL         g_recording = NO;      // grabador de acciones
+static IMP          g_orig_sendAction = NULL;
+static IMP          g_orig_vda_rec    = NULL;
+static char         g_app_bundle[1024] = {0};  // prefijo .../X.app/
 
 // ── Encontrar base de la app target ──
 // Detecta la imagen de la APP INVITADA (no LiveContainer, no sistema).
@@ -86,6 +90,15 @@ static void find_base(void) {
     g_appname = name
         ? [[NSString stringWithUTF8String:name] lastPathComponent]
         : @"app";
+    // prefijo del bundle: ".../<Nombre>.app/"  (para filtrar clases)
+    const char *dotapp = name ? strstr(name, ".app/") : NULL;
+    if(dotapp) {
+        size_t len = (size_t)(dotapp - name) + 5;   // incluir ".app/"
+        if(len < sizeof(g_app_bundle)) {
+            memcpy(g_app_bundle, name, len);
+            g_app_bundle[len] = 0;
+        }
+    }
 }
 
 // ── TermView: terminal con auto-scroll inteligente ──
@@ -462,6 +475,60 @@ static void unswizzle_instance(Class cls, SEL sel, IMP original) {
     if(!cls || !sel || !original) return;
     Method m = class_getInstanceMethod(cls, sel);
     if(m) method_setImplementation(m, original);
+}
+
+// ════════════════════════════════════════════
+//  GRABADOR DE ACCIONES (REC)
+// ════════════════════════════════════════════
+// ¿la clase pertenece a la app invitada? (main binary + sus
+// frameworks bundleados, ej. CrunchyrollUI). Descarta UIKit/Foundation.
+static BOOL is_app_class(Class c) {
+    if(!c || !g_app_bundle[0]) return NO;
+    const char *img = class_getImageName(c);
+    if(!img) return NO;
+    return strncmp(img, g_app_bundle, strlen(g_app_bundle)) == 0;
+}
+
+// Hook de -[UIApplication sendAction:to:from:forEvent:]:
+// cada tap de control pasa por acá -> loguea -[clase selector].
+static BOOL rec_sendAction(id self, SEL _cmd, SEL action,
+                           id target, id sender, UIEvent *event) {
+    if(g_recording) {
+        Class tc = target ? object_getClass(target) : nil;
+        Class sc = sender ? object_getClass(sender) : nil;
+        if(is_app_class(tc) || is_app_class(sc)) {
+            LOGL([NSString stringWithFormat:
+                @"[REC] tap → -[%s %s]  (sender: %s)",
+                tc ? class_getName(tc) : "?",
+                sel_getName(action),
+                sc ? class_getName(sc) : "?"]);
+        }
+    }
+    return ((BOOL(*)(id,SEL,SEL,id,id,UIEvent*))
+        g_orig_sendAction)(self,_cmd,action,target,sender,event);
+}
+
+// Hook de -[UIViewController viewDidAppear:]: cambios de pantalla.
+static void rec_vda(id self, SEL _cmd, BOOL animated) {
+    if(g_recording) {
+        Class c = object_getClass(self);
+        if(is_app_class(c))
+            LOGL([NSString stringWithFormat:
+                @"[REC] pantalla → %s", class_getName(c)]);
+    }
+    ((void(*)(id,SEL,BOOL))g_orig_vda_rec)(self,_cmd,animated);
+}
+
+// Instala los hooks una sola vez (quedan y se gatean por g_recording).
+static void rec_install_once(void) {
+    static BOOL done = NO;
+    if(done) return;
+    done = YES;
+    g_orig_sendAction = swizzle_instance(UIApplication.class,
+        @selector(sendAction:to:from:forEvent:),
+        (IMP)rec_sendAction);
+    g_orig_vda_rec = swizzle_instance(UIViewController.class,
+        @selector(viewDidAppear:), (IMP)rec_vda);
 }
 
 // ════════════════════════════════════════════
@@ -1053,6 +1120,20 @@ NSString *cat = categorize(sym);
     LOGL(@"[L] copiado al portapapeles");
 }
 
++ (void)recToggle {
+    g_recording = !g_recording;
+    if(g_recording) rec_install_once();
+    UIButton *b = (UIButton*)[g_panel viewWithTag:210];
+    [b setTitle:(g_recording ? @"● REC" : @"REC")
+       forState:UIControlStateNormal];
+    b.backgroundColor = g_recording
+        ? [UIColor colorWithRed:0.85 green:0.1 blue:0.1 alpha:1]
+        : [UIColor colorWithRed:0.4 green:0.2 blue:0.2 alpha:1];
+    LOGL(g_recording
+        ? @"[REC] grabando — hacé una acción (tap / cambiar pantalla)"
+        : @"[REC] detenido");
+}
+
 // ── Pestaña H (Hook) ──
 // Con selector -> hook ObjC (fuerza retorno). Sin selector -> el
 // campo "clase" se toma como símbolo C y va por GOT force-0.
@@ -1370,21 +1451,26 @@ static void build_ui(void) {
     UIColor *cOlive  = [UIColor colorWithRed:0.35 green:0.35 blue:0.15 alpha:1];
     UIColor *cPurple = [UIColor colorWithRed:0.4 green:0.1 blue:0.5 alpha:1];
 
-    // ── Controles L: TRACE / CLEAR / SAVE / COPY ──
+    // ── Controles L: TRACE / REC / CLEAR / SAVE / COPY ──
     g_ctlL = [[UIView alloc] initWithFrame:
         CGRectMake(0, ctl_y, pw, 40)];
     {
-        CGFloat w = (pw - 32) / 4.0;
+        CGFloat w = (pw - 36) / 5.0;
         UIButton *bt = mkbtn(@"TRACE", @selector(toggleTrace),
             CGRectMake(10, 0, w, 32), cGreen);
         bt.tag = 200;
         [g_ctlL addSubview:bt];
+        UIButton *rb = mkbtn(@"REC", @selector(recToggle),
+            CGRectMake(10+(w+4), 0, w, 32),
+            [UIColor colorWithRed:0.4 green:0.2 blue:0.2 alpha:1]);
+        rb.tag = 210;
+        [g_ctlL addSubview:rb];
         [g_ctlL addSubview:mkbtn(@"CLEAR", @selector(clearL),
-            CGRectMake(10+(w+4), 0, w, 32), cGray)];
+            CGRectMake(10+2*(w+4), 0, w, 32), cGray)];
         [g_ctlL addSubview:mkbtn(@"SAVE", @selector(saveL),
-            CGRectMake(10+2*(w+4), 0, w, 32), cBlue)];
+            CGRectMake(10+3*(w+4), 0, w, 32), cBlue)];
         [g_ctlL addSubview:mkbtn(@"COPY", @selector(copyL),
-            CGRectMake(10+3*(w+4), 0, w, 32), cSlate)];
+            CGRectMake(10+4*(w+4), 0, w, 32), cSlate)];
     }
     [g_panel addSubview:g_ctlL];
 
