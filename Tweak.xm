@@ -10,6 +10,7 @@
 #include <pthread.h>
 #include <mach-o/loader.h>
 #include <stdlib.h>
+#include <stdio.h>
 
 #define SAMPLE_MS    150
 #define MAX_LOG      1000
@@ -41,20 +42,50 @@ static BOOL         g_pick_mode = NO;      // inspector por toque
 static UIView      *g_pickCatcher = nil;
 
 // ── Encontrar base de la app target ──
-static void find_base(void) {
+// Detecta la imagen de la APP INVITADA (no LiveContainer, no sistema).
+// En LiveContainer el proceso host es LiveContainer; la app real se
+// carga como imagen aparte. La reconocemos por el patrón del binario
+// principal de cualquier app:  .../<Nombre>.app/<Nombre>
+static uint32_t find_target_image(void) {
     uint32_t count = _dyld_image_count();
+    // Paso 1: patrón fuerte  <Nombre>.app/<Nombre>
     for(uint32_t i = 0; i < count; i++) {
-        const char *name = _dyld_get_image_name(i);
-        if(!name) continue;
-        if(strstr(name,"LiveProcess")) continue;
-        if(strstr(name,"usr/lib"))    continue;
-        if(strstr(name,"System"))     continue;
-        if(strstr(name,"framework"))  continue;
-        g_base = (uint64_t)_dyld_get_image_header(i);
-        g_appname = [[NSString stringWithUTF8String:name]
-            lastPathComponent];
-        return;
+        const char *path = _dyld_get_image_name(i);
+        if(!path) continue;
+        if(strstr(path,"/System/"))      continue;
+        if(strstr(path,"/usr/lib/"))     continue;
+        if(strstr(path,"LiveContainer")) continue;
+        if(strstr(path,"LiveProcess"))   continue;
+        if(strstr(path,".framework/"))   continue;
+        const char *base = strrchr(path,'/');
+        if(!base || !base[1]) continue;
+        base++;                                   // "Instagram"
+        char needle[600];
+        snprintf(needle, sizeof(needle), "/%s.app/", base);
+        if(strstr(path, needle)) return i;        // <Nombre>.app/<Nombre>
     }
+    // Paso 2: fallback  primer .app/ que no sea sistema/framework/dylib
+    for(uint32_t i = 0; i < count; i++) {
+        const char *path = _dyld_get_image_name(i);
+        if(!path) continue;
+        if(strstr(path,"/System/"))      continue;
+        if(strstr(path,"/usr/lib/"))     continue;
+        if(strstr(path,"LiveContainer")) continue;
+        if(strstr(path,"LiveProcess"))   continue;
+        if(strstr(path,".framework/"))   continue;
+        if(strstr(path,".dylib"))        continue;
+        if(strstr(path,".app/")) return i;
+    }
+    return 0;
+}
+
+static void find_base(void) {
+    uint32_t i = find_target_image();
+    const char *name = _dyld_get_image_name(i);
+    g_base = (uint64_t)_dyld_get_image_header(i);
+    g_appname = name
+        ? [[NSString stringWithUTF8String:name] lastPathComponent]
+        : @"app";
 }
 
 // ── TermView: terminal con auto-scroll inteligente ──
@@ -294,19 +325,7 @@ static void force0_clear_all(void) {
 static void read_got_filtered(const char *filter) {
     BOOL all = (filter && filter[0]);
 
-    uint32_t target_idx = 0;
-    uint32_t count = _dyld_image_count();
-    for(uint32_t i = 0; i < count; i++) {
-        const char *nm = _dyld_get_image_name(i);
-        if(!nm) continue;
-        if(strstr(nm,"LiveProcess")) continue;
-        if(strstr(nm,"usr/lib"))    continue;
-        if(strstr(nm,"System"))     continue;
-        if(strstr(nm,"framework") &&
-           !strstr(nm,"Instagram")) continue;
-        target_idx = i;
-        break;
-    }
+    uint32_t target_idx = find_target_image();
     const struct mach_header_64 *mh =
         (const struct mach_header_64 *)
         _dyld_get_image_header(target_idx);
@@ -369,19 +388,7 @@ static void read_got_filtered(const char *filter) {
 // Devuelve la dirección del SLOT (void**) o NULL. Sin hardcodear:
 // se recalcula en runtime, así resiste el slide de ASLR.
 static void **find_got_slot(const char *want) {
-    uint32_t target_idx = 0;
-    uint32_t count = _dyld_image_count();
-    for(uint32_t i = 0; i < count; i++) {
-        const char *name = _dyld_get_image_name(i);
-        if(!name) continue;
-        if(strstr(name,"LiveProcess")) continue;
-        if(strstr(name,"usr/lib"))    continue;
-        if(strstr(name,"System"))     continue;
-        if(strstr(name,"framework") &&
-           !strstr(name,"Instagram")) continue;
-        target_idx = i;
-        break;
-    }
+    uint32_t target_idx = find_target_image();
 
     const struct mach_header_64 *mh =
         (const struct mach_header_64 *)
@@ -850,15 +857,14 @@ if(pt == g_self_thread) continue;
                 Dl_info info;
                 if(!dladdr((void*)pc, &info)) continue;
 
-                // Saltar si es del sistema
+                // Saltar sistema y el propio LiveContainer;
+                // dejar pasar la app invitada y sus frameworks.
                 const char *fname =
                     info.dli_fname ?: "";
-                if(strstr(fname,"usr/lib"))   continue;
-                if(strstr(fname,"System"))    continue;
-                if(strstr(fname,"framework") &&
-                   !strstr(fname,"instagram") &&
-                   !strstr(fname,"Instagram")) continue;
-                if(strstr(fname,"LiveProcess"))continue;
+                if(strstr(fname,"/System/"))    continue;
+                if(strstr(fname,"/usr/lib/"))   continue;
+                if(strstr(fname,"LiveProcess")) continue;
+                if(strstr(fname,"LiveContainer"))continue;
 
                 // Resolver nombre
                 NSString *sym;
@@ -1179,6 +1185,12 @@ NSString *cat = categorize(sym);
     [self switchTab:g_seg];
     if(!hit) { LOGD(@"[PICK] no encontré vista ahí"); return; }
     inspect_view(hit);
+    // Autocompletar: cargar la clase en el campo de H + portapapeles
+    NSString *cn = @(object_getClassName(hit));
+    g_hkCls.text = cn;
+    UIPasteboard.generalPasteboard.string = cn;
+    LOGD([NSString stringWithFormat:
+        @"  → clase cargada en H (y portapapeles): %@", cn]);
 }
 
 // ── FAB arrastrable ──
@@ -1478,4 +1490,3 @@ static void build_ui(void) {
         (int64_t)(3 * NSEC_PER_SEC)),
         dispatch_get_main_queue(), ^{ build_ui(); });
 }
-
