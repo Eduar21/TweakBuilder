@@ -536,11 +536,71 @@ static float ohook_flt(id self, SEL _cmd){
     return (float)h->dval;
 }
 
-// 1=ok  -1=clase  -2=método  -3=retorno no soportado  -4=lleno
+// ── Resolver de nombres de clase (Swift con módulo) ──
+// Intenta directo; si falla, busca la que termine en ".nombre".
+// Devuelve la Class o nil. Si hay ambigüedad, llena 'cands' y
+// devuelve nil. 'resolved' recibe el nombre completo si hubo match.
+static Class resolve_class(const char *name,
+                           NSMutableArray *cands,
+                           NSString **resolved) {
+    if(!name || !name[0]) return nil;
+    Class direct = objc_getClass(name);
+    if(direct) { if(resolved) *resolved = @(name); return direct; }
+
+    NSString *dotTarget =
+        [@"." stringByAppendingString:@(name)];
+    unsigned int n = 0;
+    Class *all = objc_copyClassList(&n);
+    Class found = nil; int count = 0;
+    for(unsigned int i = 0; i < n; i++) {
+        const char *cn = class_getName(all[i]);
+        if(!cn) continue;
+        NSString *s = @(cn);
+        if([s hasSuffix:dotTarget]) {
+            count++;
+            if(!found) found = all[i];
+            if(cands && cands.count < 20) [cands addObject:s];
+        }
+    }
+    if(all) free(all);
+    if(count == 1) {
+        if(resolved) *resolved = @(class_getName(found));
+        return found;
+    }
+    return nil;   // 0 o varias: el caller decide
+}
+
+// Igual, pero informa por el logger dado (LOGH / LOGD).
+static Class resolve_class_log(const char *name,
+                              void(*logfn)(NSString*)) {
+    NSMutableArray *cands = [NSMutableArray array];
+    NSString *resolved = nil;
+    Class c = resolve_class(name, cands, &resolved);
+    if(c) {
+        if(![resolved isEqualToString:@(name)])
+            logfn([NSString stringWithFormat:
+                @"  resuelto: %@", resolved]);
+        return c;
+    }
+    if(cands.count > 1) {
+        logfn([NSString stringWithFormat:
+            @"  ambiguo (%lu) — usá el nombre completo:",
+            (unsigned long)cands.count]);
+        for(NSString *s in cands)
+            logfn([NSString stringWithFormat:@"    %@", s]);
+    } else {
+        logfn([NSString stringWithFormat:
+            @"  clase no encontrada: %s", name]);
+    }
+    return nil;
+}
+
+// 1=ok  -1=clase (ya logueada)  -2=método  -3=no soportado  -4=lleno
 static int objc_hook_add(const char *cn, const char *sn,
-                         const char *val) {
+                         const char *val,
+                         void(*logfn)(NSString*)) {
     if(g_ohooks_n >= MAX_OBJCHOOK) return -4;
-    Class cls = objc_getClass(cn);
+    Class cls = resolve_class_log(cn, logfn);
     if(!cls) return -1;
     SEL sel = sel_registerName(sn);
     Method m = class_getInstanceMethod(cls, sel);
@@ -586,7 +646,7 @@ static void objc_hook_clear_all(void) {
 
 // Quita un hook ObjC puntual por clase+selector.
 static BOOL objc_hook_remove(const char *cn, const char *sn) {
-    Class cls = objc_getClass(cn);
+    Class cls = resolve_class(cn, nil, NULL);
     if(!cls) return NO;
     SEL sel = sel_registerName(sn);
     for(int i = 0; i < g_ohooks_n; i++) {
@@ -651,15 +711,10 @@ static void dump_class_methods(const char *clsname) {
     if(!clsname || !clsname[0]) {
         LOGD(@"[DUMP] nombre vacío"); return;
     }
-    Class cls = objc_getClass(clsname);
-    if(!cls) {
-        LOGD([NSString stringWithFormat:
-            @"[DUMP] no encontrada: %s "
-            @"(¿Swift con módulo? usa mangled)", clsname]);
-        return;
-    }
+    Class cls = resolve_class_log(clsname, LOGD);
+    if(!cls) return;
     LOGD([NSString stringWithFormat:
-        @"═══ MÉTODOS %s ═══", clsname]);
+        @"═══ MÉTODOS %s ═══", class_getName(cls)]);
 
     unsigned int n = 0;
     Method *ml = class_copyMethodList(cls, &n);
@@ -690,16 +745,12 @@ static void dump_class_ivars(const char *clsname) {
     if(!clsname || !clsname[0]) {
         LOGD(@"[IVARS] nombre vacío"); return;
     }
-    Class cls = objc_getClass(clsname);
-    if(!cls) {
-        LOGD([NSString stringWithFormat:
-            @"[IVARS] no encontrada: %s", clsname]);
-        return;
-    }
+    Class cls = resolve_class_log(clsname, LOGD);
+    if(!cls) return;
     unsigned int n = 0;
     Ivar *iv = class_copyIvarList(cls, &n);
     LOGD([NSString stringWithFormat:
-        @"═══ IVARS %s (%u) ═══", clsname, n]);
+        @"═══ IVARS %s (%u) ═══", class_getName(cls), n]);
     for(unsigned int i = 0; i < n; i++) {
         const char *tp = ivar_getTypeEncoding(iv[i]);
         LOGD([NSString stringWithFormat:@"  +0x%lx %s  %s",
@@ -1010,13 +1061,13 @@ NSString *cat = categorize(sym);
         if(s.length) {
             // Hook ObjC interactivo
             const char *val = v.length ? v.UTF8String : "0";
-            int rc = objc_hook_add(c.UTF8String, s.UTF8String, val);
+            int rc = objc_hook_add(c.UTF8String, s.UTF8String,
+                                   val, LOGH);
             switch(rc) {
                 case 1: LOGH([NSString stringWithFormat:
                     @"[H] -[%@ %@] -> %@  ON (activos: %d)",
                     c, s, v.length?v:@"0", g_ohooks_n]); break;
-                case -1: LOGH([NSString stringWithFormat:
-                    @"[H] clase no encontrada: %@", c]); break;
+                case -1: break;  // el resolver ya explicó (no encontrada/ambigua)
                 case -2: LOGH([NSString stringWithFormat:
                     @"[H] método no encontrado: -[%@ %@]", c, s]); break;
                 case -3: LOGH(@"[H] retorno no soportado "
@@ -1427,5 +1478,4 @@ static void build_ui(void) {
         (int64_t)(3 * NSEC_PER_SEC)),
         dispatch_get_main_queue(), ^{ build_ui(); });
 }
-
 
