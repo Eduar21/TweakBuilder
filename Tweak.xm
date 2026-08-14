@@ -44,6 +44,8 @@ static BOOL         g_recording = NO;      // grabador de acciones
 static IMP          g_orig_sendAction = NULL;
 static IMP          g_orig_vda_rec    = NULL;
 static char         g_app_bundle[1024] = {0};  // prefijo .../X.app/
+static id           g_snap_token = nil;         // observer de screenshot
+static NSMutableArray *g_notif_obs = nil;       // observers genéricos
 
 // ── Encontrar base de la app target ──
 // Detecta la imagen de la APP INVITADA (no LiveContainer, no sistema).
@@ -1387,7 +1389,57 @@ NSString *cat = categorize(sym);
     });
 }
 
-// ── Inspector por toque (PICK) ──
+// SNAP: escucha el screenshot y auto-dumpea el árbol en ese instante.
++ (void)snapToggle {
+    NSNotificationCenter *nc = NSNotificationCenter.defaultCenter;
+    UIButton *b = (UIButton*)[g_panel viewWithTag:220];
+    if(g_snap_token) {
+        [nc removeObserver:g_snap_token];
+        g_snap_token = nil;
+        b.backgroundColor =
+            [UIColor colorWithRed:0.2 green:0.4 blue:0.4 alpha:1];
+        LOGD(@"[SNAP] apagado");
+        return;
+    }
+    g_snap_token = [nc
+        addObserverForName:UIApplicationUserDidTakeScreenshotNotification
+        object:nil queue:[NSOperationQueue mainQueue]
+        usingBlock:^(__unused NSNotification *note){
+            LOGD(@"[SNAP] ¡screenshot! → dump del árbol:");
+            [DisasmController dTree];
+        }];
+    b.backgroundColor =
+        [UIColor colorWithRed:0.1 green:0.65 blue:0.4 alpha:1];
+    LOGD(@"[SNAP] activo — tomá una captura; auto-dumpea el árbol");
+}
+
+// NOTIF: observa la notificación cuyo nombre esté en el campo.
+// Campo vacío = borra todos los watchers.
++ (void)notifWatch {
+    NSString *name = g_dumpField.text;
+    [g_dumpField resignFirstResponder];
+    NSNotificationCenter *nc = NSNotificationCenter.defaultCenter;
+    if(!g_notif_obs) g_notif_obs = [NSMutableArray array];
+    if(!name.length) {
+        for(id t in g_notif_obs) [nc removeObserver:t];
+        [g_notif_obs removeAllObjects];
+        LOGD(@"[NOTIF] watchers borrados");
+        return;
+    }
+    id token = [nc addObserverForName:name object:nil
+        queue:[NSOperationQueue mainQueue]
+        usingBlock:^(NSNotification *note){
+            LOGD([NSString stringWithFormat:
+                @"[NOTIF] %@  obj=%s  userInfo=%@",
+                note.name,
+                note.object ? object_getClassName(note.object) : "nil",
+                note.userInfo ?: @{}]);
+        }];
+    [g_notif_obs addObject:token];
+    LOGD([NSString stringWithFormat:
+        @"[NOTIF] observando '%@' (total: %lu)",
+        name, (unsigned long)g_notif_obs.count]);
+}
 + (void)startPick {
     g_pick_mode = YES;
     if(g_pickCatcher) g_pickCatcher.hidden = NO;
@@ -1650,10 +1702,10 @@ static void build_ui(void) {
     g_ctlH.hidden = YES;
     [g_panel addSubview:g_ctlH];
 
-    // ── Controles D: campo + DUMP/IVARS/GOT/PICK/TREE (1 fila) ──
+    // ── Controles D: campo + DUMP/IVARS/GOT/PICK/TREE + SNAP/NOTIF ──
     g_ctlD = [[UIView alloc] initWithFrame:
-        CGRectMake(0, ctl_y, pw, 72)];
-    g_dumpField = mkfield(@"clase (IGMedia) o filtro GOT (Jailbroken)",
+        CGRectMake(0, ctl_y, pw, 108)];
+    g_dumpField = mkfield(@"clase · filtro GOT · nombre de notif",
         CGRectMake(10, 0, pw-20, 32));
     [g_ctlD addSubview:g_dumpField];
     {
@@ -1670,17 +1722,31 @@ static void build_ui(void) {
         [g_ctlD addSubview:mkbtn(@"TREE", @selector(dTree),
             CGRectMake(10+4*(w+4), 38, w, 30),
             [UIColor colorWithRed:0.2 green:0.45 blue:0.55 alpha:1])];
+        // fila 2: SNAP (screenshot→árbol) / NOTIF (genérico)
+        CGFloat hw = (pw - 24) / 2.0;
+        UIButton *sb = mkbtn(@"SNAP (screenshot→árbol)",
+            @selector(snapToggle),
+            CGRectMake(10, 72, hw, 30),
+            [UIColor colorWithRed:0.2 green:0.4 blue:0.4 alpha:1]);
+        sb.tag = 220;
+        [g_ctlD addSubview:sb];
+        [g_ctlD addSubview:mkbtn(@"NOTIF (nombre↑)",
+            @selector(notifWatch),
+            CGRectMake(10+(hw+4), 72, hw, 30),
+            [UIColor colorWithRed:0.45 green:0.3 blue:0.5 alpha:1])];
     }
     g_ctlD.hidden = YES;
     [g_panel addSubview:g_ctlD];
 
-    // ── Terminales. Solo H arranca más abajo (controles altos) ──
-    CGRect tfLD = CGRectMake(6, term_y, pw-12, term_h);
+    // ── Terminales. H y D arrancan más abajo (2 filas de controles) ──
+    CGRect tfL = CGRectMake(6, term_y, pw-12, term_h);
     CGFloat hterm_y = ctl_y + 196;   // H: 3 campos + 2 filas botones
     CGRect tfH = CGRectMake(6, hterm_y, pw-12, ph - hterm_y - 8);
-    g_termL = [[TermView alloc] initWithFrame:tfLD];
+    CGFloat dterm_y = ctl_y + 114;   // D: campo + 2 filas botones
+    CGRect tfD = CGRectMake(6, dterm_y, pw-12, ph - dterm_y - 8);
+    g_termL = [[TermView alloc] initWithFrame:tfL];
     g_termH = [[TermView alloc] initWithFrame:tfH];
-    g_termD = [[TermView alloc] initWithFrame:tfLD];
+    g_termD = [[TermView alloc] initWithFrame:tfD];
     g_termH.hidden = YES;
     g_termD.hidden = YES;
     [g_panel addSubview:g_termL];
