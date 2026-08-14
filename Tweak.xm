@@ -469,14 +469,6 @@ static IMP swizzle_instance(Class cls, SEL sel, IMP replacement) {
     return old;
 }
 
-// Restaura la IMP original de un método de instancia.
-__attribute__((unused))
-static void unswizzle_instance(Class cls, SEL sel, IMP original) {
-    if(!cls || !sel || !original) return;
-    Method m = class_getInstanceMethod(cls, sel);
-    if(m) method_setImplementation(m, original);
-}
-
 // ════════════════════════════════════════════
 //  GRABADOR DE ACCIONES (REC)
 // ════════════════════════════════════════════
@@ -546,6 +538,7 @@ typedef struct {
     long long ival;
     double    dval;
     IMP       orig;
+    char      enc[160];     // type encoding (para decodificar args en LOG)
 } objchook_t;
 
 #define MAX_OBJCHOOK 32
@@ -623,22 +616,73 @@ static float ohook_flt(id self, SEL _cmd){
     }
     return (float)h->dval;
 }
-// void: mode force = BLOCK (swallow, no ejecuta). mode log = ejecuta
-// + avisa. Nuestro menú siempre ejecuta.
-static void ohook_void(id self, SEL _cmd){
+// Decodifica args (x2-x7) según el type encoding. Objetos, ints,
+// BOOL, SEL, C-strings. float/double van en d0-d7: no se leen acá.
+static NSString *decode_args(const char *enc, void **args, int maxn) {
+    NSMethodSignature *sig = nil;
+    @try { sig = [NSMethodSignature signatureWithObjCTypes:enc]; }
+    @catch(__unused id e) { return @"?"; }
+    if(!sig) return @"?";
+    NSUInteger n = sig.numberOfArguments;   // incluye self,_cmd
+    NSMutableString *out = [NSMutableString string];
+    for(NSUInteger i = 2; i < n && (int)(i-2) < maxn; i++) {
+        const char *t = [sig getArgumentTypeAtIndex:i];
+        void *raw = args[i-2];
+        if(out.length) [out appendString:@", "];
+        switch(t[0]) {
+            case '@': {
+                id obj = (__bridge id)raw;
+                [out appendFormat:@"%@",
+                    obj ? [obj description] : @"nil"];
+                break;
+            }
+            case 'B': case 'c':
+                [out appendFormat:@"%d", (int)(intptr_t)raw]; break;
+            case 'i': case 's': case 'l': case 'q':
+                [out appendFormat:@"%ld", (long)(intptr_t)raw]; break;
+            case 'I': case 'S': case 'L': case 'Q':
+                [out appendFormat:@"%lu",
+                    (unsigned long)(uintptr_t)raw]; break;
+            case ':':
+                [out appendFormat:@":%s",
+                    raw ? sel_getName((SEL)raw) : "(null)"]; break;
+            case '*':
+                [out appendFormat:@"\"%s\"",
+                    raw ? (char*)raw : "(null)"]; break;
+            case 'f': case 'd':
+                [out appendString:@"<float/double no leído>"]; break;
+            default:
+                [out appendFormat:@"<%c %p>", t[0], raw]; break;
+        }
+    }
+    return out.length ? out : @"";
+}
+
+// void: force = BLOCK (swallow). log = ejecuta + loguea ARGS.
+// Captura hasta 6 args enteros/objeto de x2-x7.
+static void ohook_void(id self, SEL _cmd,
+                       void *a1, void *a2, void *a3,
+                       void *a4, void *a5, void *a6) {
     objchook_t *h = ohook_for(self,_cmd);
     if(!h) return;
+    typedef void (*fwd_t)(id,SEL,void*,void*,void*,void*,void*,void*);
+    fwd_t orig = (fwd_t)h->orig;
     if(is_our_ui(self)) {
-        ((void(*)(id,SEL))h->orig)(self,_cmd);
+        orig(self,_cmd,a1,a2,a3,a4,a5,a6); return;
+    }
+    if(h->mode == 1) {   // log con args
+        static __thread int reent = 0;
+        if(!reent) {
+            reent = 1;
+            void *args[6] = {a1,a2,a3,a4,a5,a6};
+            LOGH([NSString stringWithFormat:@"[LOG] -%s(%@)",
+                sel_getName(_cmd), decode_args(h->enc, args, 6)]);
+            reent = 0;
+        }
+        orig(self,_cmd,a1,a2,a3,a4,a5,a6);
         return;
     }
-    if(h->mode == 1) {   // log: ejecutar + avisar
-        LOGH([NSString stringWithFormat:@"[LOG] llamado: -%s",
-            sel_getName(_cmd)]);
-        ((void(*)(id,SEL))h->orig)(self,_cmd);
-        return;
-    }
-    // mode block: no hacer nada (swallow la acción)
+    // block: swallow
     LOGH([NSString stringWithFormat:@"[BLOCK] -%s (swallow)",
         sel_getName(_cmd)]);
 }
@@ -714,10 +758,12 @@ static int objc_hook_add(const char *cn, const char *sn,
     if(!m) return -2;
     const char *enc = method_getTypeEncoding(m);
     if(!enc) return -3;
-    while(*enc && strchr("rnNoORV", *enc)) enc++;  // saltar qualifiers
-    char ret = *enc;
-
     objchook_t h; memset(&h, 0, sizeof(h));
+    strncpy(h.enc, enc, sizeof(h.enc)-1);      // guardar para decode_args
+    const char *renc = enc;
+    while(*renc && strchr("rnNoORV", *renc)) renc++;  // saltar qualifiers
+    char ret = *renc;
+
     h.cls = (__bridge void*)cls; h.sel = sel;
     h.mode = (val && strcmp(val,"log")==0) ? 1 : 0;   // 'log' = observar
     IMP tramp = NULL;
@@ -738,6 +784,17 @@ static int objc_hook_add(const char *cn, const char *sn,
             tramp = (IMP)ohook_void; break;
         default:
             return -3;   // @/struct/ptr: no soportado aún
+    }
+    // ¿ya existe hook en (cls,sel)? -> actualizar modo/valor sin
+    // re-swizzlear (evita duplicados y corromper el orig).
+    for(int i = 0; i < g_ohooks_n; i++) {
+        if((__bridge Class)g_ohooks[i].cls == cls &&
+           g_ohooks[i].sel == sel) {
+            g_ohooks[i].mode = h.mode;
+            g_ohooks[i].ival = h.ival;
+            g_ohooks[i].dval = h.dval;
+            return h.kind == 3 ? (h.mode==1 ? 3 : 2) : 1;
+        }
     }
     h.orig = swizzle_instance(cls, sel, tramp);
     if(!h.orig) return -2;
@@ -921,6 +978,27 @@ static void inspect_view(UIView *v) {
     if(ml) free(ml);
     if(!shown) LOGD(@"    (ninguno directo; mirá isEnabled/isHidden de UIView/UIControl)");
     LOGD(@"════════════════════");
+}
+
+// ── Árbol de vistas: clase, hidden, alpha, frame (indentado) ──
+static int g_tree_count = 0;
+static void dump_view_tree(UIView *v, int depth) {
+    if(g_tree_count >= 400) return;
+    g_tree_count++;
+    NSMutableString *ind = [NSMutableString string];
+    for(int i = 0; i < depth && i < 20; i++)
+        [ind appendString:@"· "];
+    NSString *flags = [NSString stringWithFormat:@"%@%@",
+        v.hidden ? @" [HIDDEN]" : @"",
+        v.alpha < 0.99
+            ? [NSString stringWithFormat:@" α=%.2f", v.alpha] : @""];
+    CGRect f = v.frame;
+    LOGD([NSString stringWithFormat:
+        @"%@%s%@  {%.0f,%.0f %.0fx%.0f}",
+        ind, object_getClassName(v), flags,
+        f.origin.x, f.origin.y, f.size.width, f.size.height]);
+    for(UIView *sub in v.subviews)
+        dump_view_tree(sub, depth + 1);
 }
 
 // ── Tracer thread — samplea PCs de threads de la app ──
@@ -1289,6 +1367,26 @@ NSString *cat = categorize(sym);
 
 + (void)clearD { [g_termD clearAll]; }
 
+// Vuelca el árbol de vistas de la ventana de la app.
++ (void)dTree {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIWindow *appwin = nil;
+        NSArray *wins = g_window.windowScene.windows;
+        for(UIWindow *w in wins)
+            if(w != g_window && w.isKeyWindow) { appwin = w; break; }
+        if(!appwin)
+            for(UIWindow *w in wins)
+                if(w != g_window && !w.hidden) { appwin = w; break; }
+        LOGD(@"═══════ VIEW TREE ═══════");
+        if(!appwin) { LOGD(@"[TREE] no encontré ventana"); return; }
+        g_tree_count = 0;
+        dump_view_tree(appwin, 0);
+        LOGD([NSString stringWithFormat:
+            @"── %d vistas (cap 400) ──", g_tree_count]);
+        LOGD(@"═════════════════════════");
+    });
+}
+
 // ── Inspector por toque (PICK) ──
 + (void)startPick {
     g_pick_mode = YES;
@@ -1552,14 +1650,14 @@ static void build_ui(void) {
     g_ctlH.hidden = YES;
     [g_panel addSubview:g_ctlH];
 
-    // ── Controles D: campo + DUMP / IVARS / GOT / PICK (1 fila) ──
+    // ── Controles D: campo + DUMP/IVARS/GOT/PICK/TREE (1 fila) ──
     g_ctlD = [[UIView alloc] initWithFrame:
         CGRectMake(0, ctl_y, pw, 72)];
     g_dumpField = mkfield(@"clase (IGMedia) o filtro GOT (Jailbroken)",
         CGRectMake(10, 0, pw-20, 32));
     [g_ctlD addSubview:g_dumpField];
     {
-        CGFloat w = (pw - 32) / 4.0;
+        CGFloat w = (pw - 36) / 5.0;
         [g_ctlD addSubview:mkbtn(@"DUMP", @selector(dDump),
             CGRectMake(10, 38, w, 30), cTeal)];
         [g_ctlD addSubview:mkbtn(@"IVARS", @selector(dIvars),
@@ -1569,6 +1667,9 @@ static void build_ui(void) {
         [g_ctlD addSubview:mkbtn(@"PICK", @selector(pickToggle),
             CGRectMake(10+3*(w+4), 38, w, 30),
             [UIColor colorWithRed:0.1 green:0.6 blue:0.3 alpha:1])];
+        [g_ctlD addSubview:mkbtn(@"TREE", @selector(dTree),
+            CGRectMake(10+4*(w+4), 38, w, 30),
+            [UIColor colorWithRed:0.2 green:0.45 blue:0.55 alpha:1])];
     }
     g_ctlD.hidden = YES;
     [g_panel addSubview:g_ctlD];
