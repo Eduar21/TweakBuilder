@@ -1,6 +1,11 @@
 // AiSTweak — filtro de canales AI (AiSList) para YouTube iOS
 // Fase 1 = RECON. Poné AIS_PROBE en 1, mirá el log, y recién ahí activá el filtro.
 
+// El Makefile lo genera TweakBuilder, así que los flags de warnings van acá.
+// Sin esto, -Werror rompe el build por las funciones que quedan sin usar
+// según el valor de AIS_PROBE.
+#pragma clang diagnostic ignored "-Wunused-function"
+
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 
@@ -295,5 +300,6 @@ static void AiSHideNode(id node) {
 #endif
     }
 }
+
 
 
