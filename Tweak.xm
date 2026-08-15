@@ -174,10 +174,26 @@ static NSString *const kAiSWarnURL =
 
 @end
 
-#pragma mark - Recon: encontrar de dónde sacar el protobuf
+#pragma mark - Swizzling (sin Logos / sin CydiaSubstrate)
 
-// Loguea todos los métodos sin argumentos de una clase que devuelven objetos,
-// para descubrir cuál te da el NSData del elemento.
+// Logos genera MSHookMessageEx y linkea CydiaSubstrate, que no existe en un
+// dispositivo sin jailbreak. Acá hookeamos con el runtime de ObjC a secas,
+// igual que en FLEXING: la dylib no queda con dependencias externas.
+static BOOL AiSSwizzle(const char *clsName, SEL sel, IMP repl, IMP *origOut) {
+    Class cls = objc_getClass(clsName);
+    if (!cls) { AISLog(@"swizzle: clase %s no existe", clsName); return NO; }
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) { AISLog(@"swizzle: -[%s %@] no existe", clsName, NSStringFromSelector(sel)); return NO; }
+    if (origOut) *origOut = method_getImplementation(m);
+    method_setImplementation(m, repl);
+    AISLog(@"swizzle OK: -[%s %@]", clsName, NSStringFromSelector(sel));
+    return YES;
+}
+
+#pragma mark - Recon
+
+// Loguea los métodos sin argumentos que devuelven objetos, para descubrir
+// cuál te entrega el NSData del elemento.
 static void AiSDumpClass(const char *name) {
     Class cls = objc_getClass(name);
     if (!cls) { AISLog(@"clase %s NO existe en este build", name); return; }
@@ -185,16 +201,16 @@ static void AiSDumpClass(const char *name) {
     Method *m = class_copyMethodList(cls, &n);
     AISLog(@"=== %s (%u métodos)", name, n);
     for (unsigned int i = 0; i < n; i++) {
-        SEL sel = method_getName(m[i]);
         if (method_getNumberOfArguments(m[i]) != 2) continue;
         char ret[16];
         method_getReturnType(m[i], ret, sizeof(ret));
-        if (ret[0] == '@') AISLog(@"   -[%s %@]", name, NSStringFromSelector(sel));
+        if (ret[0] == '@')
+            AISLog(@"   -[%s %@]", name, NSStringFromSelector(method_getName(m[i])));
     }
     free(m);
 }
 
-// Dado cualquier objeto, busca ivars de tipo NSData y reporta si traen handles.
+// Busca ivars NSData en cualquier objeto y reporta si traen handles de la lista.
 static void AiSProbeObject(id obj) {
     if (!obj) return;
     Class cls = object_getClass(obj);
@@ -215,15 +231,30 @@ static void AiSProbeObject(id obj) {
     free(ivars);
 }
 
+#pragma mark - Ocultado
+
+// ELMCellNode hereda de ASCellNode (Texture); usamos KVC para no depender
+// de headers de AsyncDisplayKit.
+static void AiSHideNode(id node) {
+    if ([node respondsToSelector:@selector(setHidden:)])
+        [node setValue:@YES forKey:@"hidden"];
+    @try {
+        id style = [node valueForKey:@"style"];
+        if (style) {
+            [style setValue:@0 forKey:@"height"];
+            [style setValue:@0 forKey:@"minHeight"];
+            [style setValue:@0 forKey:@"maxHeight"];
+        }
+    } @catch (__unused NSException *e) {}
+}
+
 #pragma mark - Hooks
 
-// Ajustá el nombre real después del recon. En builds recientes de YouTube iOS
-// los elementos del feed viven en el framework "Elements" (clases ELM*)
-// y el protobuf serializado en YTIElementRenderer.
-%hook YTIElementRenderer
+static IMP gOrigElementData = NULL;
+static IMP gOrigDidLoad = NULL;
 
-- (NSData *)elementData {
-    NSData *d = %orig;
+static NSData *AiS_elementData(id self, SEL _cmd) {
+    NSData *d = ((NSData *(*)(id, SEL))gOrigElementData)(self, _cmd);
 #if AIS_PROBE
     static NSUInteger seen = 0;
     if (d.length && seen < 30) {
@@ -231,65 +262,55 @@ static void AiSProbeObject(id obj) {
         NSString *hit = nil;
         BOOL m = [[AiSStore shared] dataMatches:d matched:&hit];
         AISLog(@"elementData #%lu %lu bytes match=%@ (%@)",
-               (unsigned long)seen, (unsigned long)d.length, m ? @"SI" : @"no", hit ?: @"-");
+               (unsigned long)seen, (unsigned long)d.length,
+               m ? @"SI" : @"no", hit ?: @"-");
     }
 #endif
     return d;
 }
 
-%end
-
-// Ocultado: se marca el nodo/celda con altura 0.
-// ELMCellNode hereda de ASCellNode (Texture), así que usamos KVC para no
-// depender de headers de AsyncDisplayKit.
-static void AiSHideNode(id node) {
-    if ([node respondsToSelector:@selector(setHidden:)])
-        [node setValue:@YES forKey:@"hidden"];
-    @try {
-        id style = [node valueForKey:@"style"];
-        if (style) {
-            [style setValue:@0 forKey:@"height"];   // puede requerir ASDimension real
-            [style setValue:@0 forKey:@"minHeight"];
-            [style setValue:@0 forKey:@"maxHeight"];
-        }
-    } @catch (__unused NSException *e) {}
-}
-
-%hook ELMCellNode
-
-- (void)didLoad {
-    %orig;
+static void AiS_didLoad(id self, SEL _cmd) {
+    ((void (*)(id, SEL))gOrigDidLoad)(self, _cmd);
 #if AIS_PROBE
     static NSUInteger seen = 0;
     if (seen < 10) { seen++; AiSProbeObject(self); }
 #else
-    // Buscá el renderer asociado y compará. Ajustar tras el recon:
     @try {
         id ctrl = [self valueForKey:@"nodeController"];
         id renderer = ctrl ? [ctrl valueForKey:@"renderer"] : nil;
-        NSData *d = renderer ? [renderer valueForKey:@"elementData"] : nil;
+        id d = renderer ? [renderer valueForKey:@"elementData"] : nil;
         NSString *hit = nil;
         if ([d isKindOfClass:[NSData class]] &&
-            [[AiSStore shared] dataMatches:d matched:&hit]) {
+            [[AiSStore shared] dataMatches:(NSData *)d matched:&hit]) {
             [AiSStore shared].hits++;
-            AISLog(@"bloqueado @%@ (total %lu)", hit, (unsigned long)[AiSStore shared].hits);
+            AISLog(@"bloqueado @%@ (total %lu)", hit,
+                   (unsigned long)[AiSStore shared].hits);
             AiSHideNode(self);
         }
     } @catch (__unused NSException *e) {}
 #endif
 }
 
-%end
-
 #pragma mark - Init
 
-%ctor {
+__attribute__((constructor))
+static void AiSInit(void) {
     @autoreleasepool {
         AiSRotateLog();
         AISLog(@"===== sesión nueva =====");
         AISLog(@"log: %@", AiSLogPath());
         [[AiSStore shared] load];
         AISLog(@"AiSTweak cargado en %@", [[NSBundle mainBundle] bundleIdentifier]);
+
+        // Las clases de YouTube pueden no estar registradas todavía en el
+        // constructor, así que swizzleamos apenas arranca el run loop.
+        dispatch_async(dispatch_get_main_queue(), ^{
+            AiSSwizzle("YTIElementRenderer", @selector(elementData),
+                       (IMP)AiS_elementData, &gOrigElementData);
+            AiSSwizzle("ELMCellNode", @selector(didLoad),
+                       (IMP)AiS_didLoad, &gOrigDidLoad);
+        });
+
 #if AIS_PROBE
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
@@ -300,6 +321,3 @@ static void AiSHideNode(id node) {
 #endif
     }
 }
-
-
-
