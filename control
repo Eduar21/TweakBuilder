@@ -1,5 +1,5 @@
-Package: com.eduar21.disasm
-Name: Disasm
+Package: com.eduar21.iayt
+Name: Iayt
 Version: 1.0
 Architecture: iphoneos-arm64
 Description: iOS Tweak
