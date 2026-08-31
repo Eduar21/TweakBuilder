@@ -165,6 +165,7 @@ static void drm_screenshot_monitor_start(void) {
         return;
     }
     NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+    __weak NSNotificationCenter *weakNC = nc;
 
     [nc addObserverForName:UIApplicationWillResignActiveNotification
         object:nil queue:[NSOperationQueue mainQueue]
@@ -178,8 +179,10 @@ static void drm_screenshot_monitor_start(void) {
         usingBlock:^(NSNotification *note) {
             LOGC(@"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
             LOGC(@"[SS] UIApplicationUserDidTakeScreenshotNotification");
+            NSNotificationCenter *strongNC = weakNC;
+            if(!strongNC) return;
             @try {
-                id obsArray = [nc
+                id obsArray = [strongNC
                     performSelector:@selector(_observersForObject:name:)
                     withObject:nil
                     withObject:UIApplicationUserDidTakeScreenshotNotification];
@@ -274,7 +277,8 @@ static void drm_find_player_views(void) {
         if(!img||strstr(img,"/System/")||strstr(img,"/usr/lib/")) continue;
         if(!class_getClassMethod(all[i], @selector(layerClass))) continue;
         @try {
-            Class lc = (Class)[(__bridge id)all[i] performSelector:@selector(layerClass)];
+            IMP layerClassIMP = method_getImplementation(class_getClassMethod(all[i], @selector(layerClass)));
+            Class lc = ((Class(*)(id,SEL))layerClassIMP)(all[i], @selector(layerClass));
             if(lc == [AVPlayerLayer class] ||
                [NSStringFromClass(lc) containsString:@"AVPlayer"]) {
                 LOGC([NSString stringWithFormat:@"  ✓ %s → %@",
@@ -554,7 +558,7 @@ static void **find_got_slot(const char *want) {
                     if(!got[k]) continue;
                     Dl_info info;
                     if(!dladdr((void*)got[k],&info)||!info.dli_sname) continue;
-                    if(strcmp(info.dli_sname, want)==0) return &got[k];
+                    if(strcmp(info.dli_sname, want)==0) return (void **)&got[k];
                 }
             }
         }
