@@ -43,8 +43,7 @@ static UISegmentedControl *g_seg = nil;
 static BOOL         g_pick_mode = NO;
 static UIView      *g_pickCatcher = nil;
 static BOOL         g_recording = NO;
-static IMP          g_orig_sendAction = NULL;
-static IMP          g_orig_vda_rec    = NULL;
+
 static char         g_app_bundle[1024] = {0};
 static id           g_snap_token = nil;
 static NSMutableArray *g_notif_obs = nil;
@@ -899,7 +898,7 @@ static void dump_view_tree(UIView *v, int depth) {
 }
 
 // ── Recorder ──
-static IMP g_orig_sendAction_rec = NULL;
+
 static void rec_install_once(void);
 static void (*g_orig_vda)(id,SEL,id) = NULL;
 
